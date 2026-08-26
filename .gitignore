@@ -1,0 +1,39 @@
+# Data
+/Dataset/
+/datasets/
+/data/
+/66878_Images/
+# Weights
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.bin
+# Results
+results/
+logs/
+runs/
+outputs/
+cache/
+Gradcam/
+self_teaching_results/
+# Sensitive/analysis outputs
+*_revised.csv
+*label_replaced*.csv
+*replacement*.csv
+*revision_audit*.csv
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Environment
+.venv/
+venv/
+env/
+.env
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,3 @@
+active_task: task1
+data:
+  manifest: Dataset/task1/manifest.csv
