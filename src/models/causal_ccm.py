@@ -70,15 +70,21 @@ class SemanticAlignment(nn.Module):
 
 
 class DynamicPredictionHead(nn.Module):
-    def __init__(self, feature_dim: int, text_dim: int, output_dim: int, task_count: int, task_dim: int, hidden_dim: int) -> None:
+    def __init__(self, feature_dim: int, text_dim: int, output_dim: int, task_count: int,
+                 task_dim: int, hidden_dim: int, trunk_width: int = 512,
+                 generator_hidden: int = 256) -> None:
         super().__init__()
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.task_embedding = nn.Embedding(task_count, task_dim)
         self.hypernetwork = nn.Sequential(
-            nn.Linear(text_dim + task_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim), nn.GELU()
+            nn.Linear(text_dim + task_dim, trunk_width), nn.GELU(),
+            nn.Linear(trunk_width, hidden_dim), nn.GELU()
         )
-        self.generator = nn.Linear(hidden_dim, feature_dim * output_dim + output_dim)
+        self.generator = nn.Sequential(
+            nn.Linear(hidden_dim, generator_hidden), nn.GELU(),
+            nn.Linear(generator_hidden, feature_dim * output_dim + output_dim),
+        )
 
     def forward(self, features: Tensor, patient: Tensor, task_id: Tensor) -> tuple[Tensor, Tensor]:
         task = self.task_embedding(task_id)
@@ -123,8 +129,9 @@ class CausalCCM(nn.Module):
         attention_dim = int(model_config["attention_dim"])
         self.alignment = SemanticAlignment(retained, text_dim, attention_dim)
         self.dynamic_head = DynamicPredictionHead(
-            attention_dim, text_dim, int(task["output_dim"]), 5,
+            attention_dim, text_dim, int(task["output_dim"]), int(model_config["task_count"]),
             int(model_config["task_embedding_dim"]), int(model_config["hyper_hidden_dim"]),
+            int(model_config["hyper_trunk_dims"][0]), int(model_config["generator_hidden_dim"]),
         )
         self.auxiliary_head = nn.Linear(channels, int(task["output_dim"]))
 
@@ -165,4 +172,5 @@ class CausalCCM(nn.Module):
 
 
 def build_model(task: dict[str, Any], model_config: dict[str, Any]) -> CausalCCM:
-    return CausalCCM(task, model_config, int(task["id"].replace("task", "")) - 1)
+    task_index = {"task1": 0, "task2": 1, "task3": 2, "task4": 4, "task5": 5}[task["id"]]
+    return CausalCCM(task, model_config, task_index)

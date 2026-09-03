@@ -1,16 +1,19 @@
 # CCM-DiagProg
 
-CCM-DiagProg is a unified framework for diagnosis, clinical metric regression, and prognosis from corneal confocal microscopy images. It combines visual representation learning, clinical text encoding, cross-modal fusion, causal channel screening, and task-conditioned prediction heads.
+Official implementation of the unified Causal-CCM framework for diagnosis, clinical metric regression, and prognosis from corneal confocal microscopy images.
 
 ## Tasks
 
-| Task | Objective | Output |
-|---|---|---|
-| Task 1 | Ocular neuroimmune diagnosis | HC / DED / NCP |
-| Task 2 | Systemic small-fiber neuropathy diagnosis | HC / NODPN / DPN |
-| Task 3 | Clinical reference metric regression | HbA1c / CFS / TBUT / SIT / OSDI |
-| Task 4 | One-month treatment prognosis | ΔCFS / ΔTBUT / ΔSIT / ΔOSDI |
-| Task 5 | Six-month postoperative prognosis | Non-persistent / Persistent |
+| Identity | Task | Output |
+|---:|---|---|
+| 1 | Ocular-surface diagnosis | HC, DED, NCP |
+| 2 | Systemic neuropathy diagnosis | HC, NODPN, DPN |
+| 3 | Ocular-surface metric regression | CFS, TBUT, SIT, OSDI |
+| 4 | Glycemic metric regression | HbA1c |
+| 5 | One-month prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
+| 6 | Six-month prognosis | Non-persistent, Persistent |
+
+All identities share one ResNet-50 visual encoder, ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator.
 
 ## Installation
 
@@ -20,69 +23,55 @@ conda activate ccm-diagprog
 pip install -e .
 ```
 
-## Data preparation
+## Manifest format
 
-Create one CSV manifest for each task. Every manifest must contain `image_path`, `patient_id`, and `split`, where `split` is `train`, `validation`, or `test`.
-
-Classification manifests additionally contain:
+Prepare `task1.csv` through `task5.csv` in one manifest directory. Each CSV contains:
 
 ```text
-label,class_name
+image_path,patient_id,split,clinical_text
 ```
 
-Regression manifests additionally contain their target columns and optional structured clinical fields prefixed with `clinical_`.
+`split` is `train`, `validation`, or `test`. Classification manifests also contain `label` and `class_name`. Regression manifests contain the target columns defined in `configs/default.yaml`.
 
-Place the manifests at the paths configured in `configs/task1.yaml` through `configs/task5.yaml`, or pass a path directly with `--manifest`.
+Task 3 supplies two shared-model identities: ocular-surface regression and HbA1c regression.
 
 ## Training
 
-Run one task at a time:
-
-```bash
-python train.py --config configs/task1.yaml
-python train.py --config configs/task2.yaml
-python train.py --config configs/task3.yaml
-python train.py --config configs/task4.yaml
-python train.py --config configs/task5.yaml
-```
-
-To use another manifest:
+Train the six identities sequentially in one shared model:
 
 ```bash
 python train.py \
-  --config configs/task1.yaml \
-  --manifest Dataset/task1/manifest.csv
+  --config configs/default.yaml \
+  --manifests-dir /path/to/manifests \
+  --output checkpoints/unified_six_task
 ```
 
-The best checkpoint and periodic checkpoints are saved under `checkpoints/<task>/`.
+The trainer saves the best checkpoint for each identity, a final shared checkpoint, and periodic checkpoints every 10 epochs.
 
-## Evaluation
+## Inference
 
 ```bash
-python evaluate.py \
-  --config configs/task1.yaml \
-  --manifest Dataset/task1/manifest.csv \
-  --checkpoint checkpoints/task1/best_model.pt
+python infer.py \
+  --config configs/default.yaml \
+  --manifest /path/to/test.csv \
+  --checkpoint checkpoints/unified_six_task/best_task_0.pt \
+  --identity 0 \
+  --output predictions.csv
 ```
 
-Use the corresponding configuration and checkpoint paths for Tasks 2–5.
-
-## Tests
+Text-missing evaluation is controlled with `--text-missingness`:
 
 ```bash
-pip install -e ".[test]"
+python infer.py ... --text-missingness 0.0
+python infer.py ... --text-missingness 0.5
+python infer.py ... --text-missingness 1.0
+```
+
+Identity indices are zero-based and follow the task table above.
+
+## Test
+
+```bash
 pytest
 ```
 
-## Project structure
-
-```text
-configs/        Task configurations
-scripts/        Shared training and evaluation utilities
-src/data/       Dataset, manifest, audit, and split logic
-src/models/     Causal-CCM architecture and channel screening
-src/training/   Training, early stopping, and checkpoints
-src/evaluation/ Metrics
-train.py        Training entry point
-evaluate.py     Evaluation entry point
-```

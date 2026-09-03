@@ -19,15 +19,34 @@ model:
   visual_backbone: resnet50
   pretrained_visual: true
   clinical_encoder: emilyalsentzer/Bio_ClinicalBERT
+  clinical_missingness_eval: 0.0
   pretrained_text: true
   max_sequence_length: 128
   attention_dim: 256
   task_embedding_dim: 32
+  hyper_input_dim: 800
+  hyper_trunk_dims: [512, 256]
   hyper_hidden_dim: 256
+  generator_hidden_dim: 256
+  task_count: 6
+  task_loss_weight: 0.16666666666666666
   retained_channel_ratio: 0.30
   structural_temperature: 0.10
   structural_loss_weight: 1.0
-  hyper_loss_weight: 1.0e-5
+  hyper_loss_weight: 5.0e-4
+  relation_bootstrap_initial: 50
+  relation_bootstrap_increment: 25
+  relation_bootstrap_max: 500
+  relation_bootstrap_confidence: 0.95
+  permutation_min: 200
+  permutation_max: 5000
+  permutation_confidence: 0.99
+  nmi_estimator: knn
+  nmi_neighbors: 5
+  nmi_normalization: geometric_entropy
+  kci_gcv_min: 1.0e-6
+  kci_gcv_max: 1.0e1
+  kci_gcv_candidates: 50
   screening_fdr: 0.05
   screening_permutations: 100
   screening_max_samples: 256
@@ -45,7 +64,7 @@ training:
   precision: fp32
   early_stopping:
     enabled: true
-    patience: 8
+    patience: 20
     min_delta: 1.0e-4
     min_epochs: 15
 

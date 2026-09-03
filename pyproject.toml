@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "causal-ccm-reproduction"
+name = "ccm-diagprog"
 version = "0.1.0"
-description = "Auditable reproduction pipeline for Causal-CCM"
+description = "Unified Causal-CCM diagnosis and prognosis framework"
 requires-python = ">=3.8"
 dependencies = [
   "numpy>=1.24",

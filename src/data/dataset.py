@@ -19,6 +19,7 @@ class CCMManifestDataset(Dataset):
         resolution: int = 384,
         transform: Optional[Callable] = None,
         max_length: int = 128,
+        clinical_missingness: float | None = None,
     ) -> None:
         self.frame = frame.reset_index(drop=True)
         self.task = task
@@ -26,6 +27,7 @@ class CCMManifestDataset(Dataset):
         self.resolution = resolution
         self.transform = transform
         self.max_length = max_length
+        self.clinical_missingness = clinical_missingness
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -43,8 +45,13 @@ class CCMManifestDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
-        encoded = None if self.task.get("image_only", False) else self.tokenizer(
-            str(row.get("clinical_text", "No clinical context available.")), max_length=self.max_length,
+        text=str(row.get("clinical_text", "")).strip(); fields=[x.strip() for x in text.split(";") if x.strip()]
+        unavailable=(not fields) or text.casefold().startswith("clinical context unavailable")
+        q=float(torch.rand(())) if self.clinical_missingness is None else float(self.clinical_missingness)
+        n=round(q*len(fields)); order=torch.randperm(len(fields)).tolist(); removed=set(order[:n]); fields=[x for i,x in enumerate(fields) if i not in removed]
+        available=(not unavailable) and bool(fields); sentence="; ".join(fields) if available else "No clinical context available."
+        encoded = self.tokenizer(
+            sentence, max_length=self.max_length,
             padding="max_length", truncation=True, return_tensors="pt",
         )
         if self.task["kind"] == "classification":
@@ -59,8 +66,9 @@ class CCMManifestDataset(Dataset):
         structured = np.nan_to_num(structured, nan=0.0)
         return {
             "image": self._image(row.image_path),
-            "input_ids": torch.empty(0, dtype=torch.long) if encoded is None else encoded["input_ids"].squeeze(0),
-            "attention_mask": torch.empty(0, dtype=torch.long) if encoded is None else encoded["attention_mask"].squeeze(0),
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "clinical_available": torch.tensor(available,dtype=torch.bool),
             "target": target,
             "target_mask": mask,
             "clinical_structured": torch.from_numpy(structured),
