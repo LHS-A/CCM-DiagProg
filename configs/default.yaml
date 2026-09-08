@@ -18,7 +18,8 @@ data:
 model:
   visual_backbone: resnet50
   pretrained_visual: true
-  clinical_encoder: emilyalsentzer/Bio_ClinicalBERT
+  clinical_encoder: nlpie/tiny-clinicalbert
+  patient_semantic_dim: 768
   clinical_missingness_eval: 0.0
   pretrained_text: true
   max_sequence_length: 128

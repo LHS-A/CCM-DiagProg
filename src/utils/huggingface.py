@@ -11,8 +11,12 @@ def resolve_cached_model(identifier: str) -> str:
     cache_name = "models--" + identifier.replace("/", "--")
     snapshots = Path.home() / ".cache" / "huggingface" / "hub" / cache_name / "snapshots"
     if snapshots.is_dir():
-        candidates = sorted(path for path in snapshots.iterdir() if (path / "config.json").is_file())
+        weight_names = ("model.safetensors", "pytorch_model.bin", "tf_model.h5", "flax_model.msgpack")
+        candidates = sorted(
+            path for path in snapshots.iterdir()
+            if (path / "config.json").is_file()
+            and any((path / name).exists() for name in weight_names)
+        )
         if candidates:
             return str(candidates[-1])
     return identifier
-

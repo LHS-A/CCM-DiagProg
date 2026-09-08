@@ -2,7 +2,7 @@
 
 Official PyTorch implementation of the unified prior-guided and patient-adaptive framework for corneal confocal microscopy analysis.
 
-The model jointly supports six clinical objectives through one shared visual encoder, ClinicalBERT semantic encoder, task-conditioned feature subsets, shared hypernetwork, and task-specific parameter generators.
+The model jointly supports six clinical objectives through one shared visual encoder, Tiny ClinicalBERT semantic encoder, task-conditioned feature subsets, shared hypernetwork, and task-specific parameter generators. The default `nlpie/tiny-clinicalbert` output is projected from 312 to the framework's fixed 768-dimensional patient-semantic space.
 
 | Identity | Objective | Output |
 |---:|---|---|
@@ -34,7 +34,7 @@ conda activate ccm-diagprog
 pip install -e .
 ```
 
-ClinicalBERT and ImageNet-pretrained ResNet-50 weights are downloaded through their standard Hugging Face and torchvision interfaces when they are not already cached.
+Tiny ClinicalBERT and ImageNet-pretrained ResNet-50 weights are downloaded through their standard Hugging Face and torchvision interfaces when they are not already cached.
 
 ## Data manifests
 
@@ -101,6 +101,10 @@ python infer.py ... --text-missingness 0.5
 python infer.py ... --text-missingness 1.0
 ```
 
+## Inference complexity
+
+For one 384×384 image and 128 Tiny ClinicalBERT tokens, the complete inference deployment contains 43.291 M parameters and requires 25.906 GFLOPs (`1 MAC = 2 FLOPs`).
+
 ## Tests
 
 ```bash
@@ -108,4 +112,3 @@ pytest -q
 ```
 
 The repository intentionally excludes datasets, trained weights, predictions, and experiment-specific result files.
-

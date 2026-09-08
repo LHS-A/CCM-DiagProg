@@ -25,7 +25,9 @@ class UnifiedCausalCCM(nn.Module):
     def __init__(self,cfg:dict[str,Any]):
         super().__init__();self.visual_encoder=ResNet50Features(bool(cfg['pretrained_visual']));channels=self.visual_encoder.out_channels
         self.text_encoder=AutoModel.from_pretrained(resolve_cached_model(cfg['clinical_encoder']))
-        if self.text_encoder.config.hidden_size!=768: raise ValueError('ClinicalBERT hidden size must be 768')
+        text_hidden=int(self.text_encoder.config.hidden_size)
+        semantic_dim=int(cfg.get('patient_semantic_dim',768))
+        self.text_projection=nn.Identity() if text_hidden==semantic_dim else nn.Linear(text_hidden,semantic_dim)
         self.structural_priors=nn.ModuleList(StructuralPrior(channels) for _ in TASKS)
         self.register_buffer('channel_masks',torch.ones(6,channels,dtype=torch.bool))
         self.context=SemanticContext(channels,int(cfg['attention_dim']),8);self.task_embedding=nn.Embedding(6,int(cfg['task_embedding_dim']))
@@ -41,7 +43,7 @@ class UnifiedCausalCCM(nn.Module):
             return {'prediction':self.auxiliary[task](F.adaptive_avg_pool2d(feature,1).flatten(1)),
                     'prior_loss':self.structural_priors[task].loss(feature),'hyper_loss':feature.new_zeros(())}
         if bool(available.any()):
-            text=self.text_encoder(input_ids=ids,attention_mask=attention).last_hidden_state
+            text=self.text_projection(self.text_encoder(input_ids=ids,attention_mask=attention).last_hidden_state)
             text=text*available[:,None,None].to(text.dtype);patient=text[:,0]
         else:
             text=None;patient=feature.new_zeros(len(image),768)
