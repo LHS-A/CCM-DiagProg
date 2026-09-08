@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccm-diagprog"
-version = "0.1.0"
-description = "Unified Causal-CCM diagnosis and prognosis framework"
+version = "0.2.0"
+description = "Unified prior-guided and patient-adaptive framework for corneal confocal microscopy analysis"
 requires-python = ">=3.8"
 dependencies = [
+  "joblib>=1.2",
   "numpy>=1.24",
   "pandas>=2.0",
   "Pillow>=9.0",
@@ -20,7 +21,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-complexity = ["fvcore>=0.1.5", "thop>=0.1.1"]
 test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]

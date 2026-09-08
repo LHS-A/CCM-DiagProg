@@ -20,6 +20,7 @@ class CCMManifestDataset(Dataset):
         transform: Optional[Callable] = None,
         max_length: int = 128,
         clinical_missingness: float | None = None,
+        excluded_clinical_fields: Optional[set[str]] = None,
     ) -> None:
         self.frame = frame.reset_index(drop=True)
         self.task = task
@@ -28,6 +29,7 @@ class CCMManifestDataset(Dataset):
         self.transform = transform
         self.max_length = max_length
         self.clinical_missingness = clinical_missingness
+        self.excluded_clinical_fields = {x.casefold() for x in (excluded_clinical_fields or set())}
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -46,6 +48,10 @@ class CCMManifestDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
         text=str(row.get("clinical_text", "")).strip(); fields=[x.strip() for x in text.split(";") if x.strip()]
+        def allowed(name: str) -> bool:
+            key=name.strip().casefold(); short=key[len("clinical_"):] if key.startswith("clinical_") else key
+            return key not in self.excluded_clinical_fields and short not in self.excluded_clinical_fields
+        fields=[x for x in fields if allowed(x.split(":",1)[0])]
         unavailable=(not fields) or text.casefold().startswith("clinical context unavailable")
         q=float(torch.rand(())) if self.clinical_missingness is None else float(self.clinical_missingness)
         n=round(q*len(fields)); order=torch.randperm(len(fields)).tolist(); removed=set(order[:n]); fields=[x for i,x in enumerate(fields) if i not in removed]
@@ -61,7 +67,7 @@ class CCMManifestDataset(Dataset):
             values = np.asarray([row[x] for x in self.task["targets"]], dtype=np.float32)
             target = torch.from_numpy(np.nan_to_num(values, nan=0.0))
             mask = torch.from_numpy(np.isfinite(values))
-        structured_columns = sorted(x for x in self.frame.columns if x.startswith("clinical_") and x != "clinical_text")
+        structured_columns = sorted(x for x in self.frame.columns if x.startswith("clinical_") and x != "clinical_text" and allowed(x))
         structured = np.asarray([row[x] for x in structured_columns], dtype=np.float32) if structured_columns else np.empty(0, dtype=np.float32)
         structured = np.nan_to_num(structured, nan=0.0)
         return {

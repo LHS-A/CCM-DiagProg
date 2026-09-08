@@ -44,7 +44,8 @@ class StructuralPrior(nn.Module):
         flat = features.flatten(2)
         minimum = flat.amin(dim=-1, keepdim=True)
         normalized = (flat - minimum) / (flat.amax(dim=-1, keepdim=True) - minimum + 1e-6)
-        dependency = torch.einsum("bcp,bdp->cd", normalized, normalized) / (features.shape[0] * flat.shape[-1])
+        normalized = normalized / (normalized.square().sum(-1, keepdim=True).sqrt() + 1e-6)
+        dependency = torch.einsum("bcp,bdp->cd", normalized, normalized) / features.shape[0]
         eye = torch.eye(dependency.shape[0], device=dependency.device, dtype=dependency.dtype)
         dependency = dependency * (1 - eye)
         prior = self.prior.to(dependency.dtype) * (1 - eye)

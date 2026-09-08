@@ -1,19 +1,30 @@
 # CCM-DiagProg
 
-Official implementation of the unified Causal-CCM framework for diagnosis, clinical metric regression, and prognosis from corneal confocal microscopy images.
+Official PyTorch implementation of the unified prior-guided and patient-adaptive framework for corneal confocal microscopy analysis.
 
-## Tasks
+The model jointly supports six clinical objectives through one shared visual encoder, ClinicalBERT semantic encoder, task-conditioned feature subsets, shared hypernetwork, and task-specific parameter generators.
 
-| Identity | Task | Output |
+| Identity | Objective | Output |
 |---:|---|---|
-| 1 | Ocular-surface diagnosis | HC, DED, NCP |
-| 2 | Systemic neuropathy diagnosis | HC, NODPN, DPN |
-| 3 | Ocular-surface metric regression | CFS, TBUT, SIT, OSDI |
-| 4 | Glycemic metric regression | HbA1c |
-| 5 | One-month prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
-| 6 | Six-month prognosis | Non-persistent, Persistent |
+| 0 | Ocular neuroimmune diagnosis | HC, DED, NCP |
+| 1 | Systemic small-fiber neuropathy diagnosis | HC, NODPN, DPN |
+| 2 | Ocular clinical metric regression | CFS, TBUT, SIT, OSDI |
+| 3 | Glycemic metric regression | HbA1c |
+| 4 | One-month treatment prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
+| 5 | Six-month postoperative prognosis | Non-persistent, Persistent |
 
-All identities share one ResNet-50 visual encoder, ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator.
+## Method
+
+The implementation contains:
+
+- min–max-normalized visual relation modeling and prior-guided off-diagonal alignment;
+- Pearson, Spearman, distance-correlation, and k-NN normalized mutual-information clinical relations;
+- adaptive bootstrap stability weighting and clinical-to-visual prior projection;
+- task-conditioned HSIC relevance and KCI conditional-robustness screening with GCV, sequential permutation testing, and Benjamini–Hochberg correction;
+- leakage-controlled clinical serialization and stochastic clinical-context dropout;
+- eight-head semantic-to-visual cross-attention;
+- a shared `800 → 512 → 256` hypernetwork and six task-specific dynamic parameter generators;
+- two-stage, equally weighted joint optimization across all six task identities.
 
 ## Installation
 
@@ -23,30 +34,51 @@ conda activate ccm-diagprog
 pip install -e .
 ```
 
-## Manifest format
+ClinicalBERT and ImageNet-pretrained ResNet-50 weights are downloaded through their standard Hugging Face and torchvision interfaces when they are not already cached.
 
-Prepare `task1.csv` through `task5.csv` in one manifest directory. Each CSV contains:
+## Data manifests
+
+Prepare five CSV manifests in one directory:
+
+```text
+task1.csv
+task2.csv
+task3.csv
+task4.csv
+task5.csv
+```
+
+Every manifest contains:
 
 ```text
 image_path,patient_id,split,clinical_text
 ```
 
-`split` is `train`, `validation`, or `test`. Classification manifests also contain `label` and `class_name`. Regression manifests contain the target columns defined in `configs/default.yaml`.
+`split` must be `train`, `validation`, or `test`. Classification manifests additionally contain `label` and `class_name`. Regression manifests contain the target columns declared in `configs/default.yaml`. Structured clinical fields use the `clinical_` prefix. Direct targets, future variables, and label-construction proxies must be listed under each task's `clinical_exclude` configuration.
 
-Task 3 supplies two shared-model identities: ocular-surface regression and HbA1c regression.
+Task 3 is divided into identities 2 and 3 while sharing the same manifest.
 
 ## Training
-
-Train the six identities sequentially in one shared model:
 
 ```bash
 python train.py \
   --config configs/default.yaml \
   --manifests-dir /path/to/manifests \
-  --output checkpoints/unified_six_task
+  --output checkpoints/unified_six_task \
+  --seed 3407
 ```
 
-The trainer saves the best checkpoint for each identity, a final shared checkpoint, and periodic checkpoints every 10 epochs.
+Training first warms up the visual auxiliary heads, constructs and fixes the clinical relation priors, performs prior alignment and task-conditioned channel screening, then freezes the refined visual encoder and trains semantic contextualization and the hypernetwork. All six objectives receive weight `1/6`. Periodic checkpoints are written every 10 epochs and the best Stage-II shared model is saved as `best_model.pt`.
+
+To resume after a completed Stage-I checkpoint:
+
+```bash
+python train.py \
+  --config configs/default.yaml \
+  --manifests-dir /path/to/manifests \
+  --output checkpoints/unified_six_task \
+  --resume-stage1 checkpoints/unified_six_task/epoch_0030.pt
+```
 
 ## Inference
 
@@ -54,12 +86,14 @@ The trainer saves the best checkpoint for each identity, a final shared checkpoi
 python infer.py \
   --config configs/default.yaml \
   --manifest /path/to/test.csv \
-  --checkpoint checkpoints/unified_six_task/best_task_0.pt \
+  --checkpoint checkpoints/unified_six_task/best_model.pt \
   --identity 0 \
-  --output predictions.csv
+  --text-missingness 0.0 \
+  --output predictions.csv \
+  --metrics metrics.csv
 ```
 
-Text-missing evaluation is controlled with `--text-missingness`:
+Clinical-context availability can be evaluated without changing the model:
 
 ```bash
 python infer.py ... --text-missingness 0.0
@@ -67,11 +101,11 @@ python infer.py ... --text-missingness 0.5
 python infer.py ... --text-missingness 1.0
 ```
 
-Identity indices are zero-based and follow the task table above.
-
-## Test
+## Tests
 
 ```bash
-pytest
+pytest -q
 ```
+
+The repository intentionally excludes datasets, trained weights, predictions, and experiment-specific result files.
 
