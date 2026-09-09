@@ -112,11 +112,12 @@ def adaptive_bootstrap(estimator: Callable[[np.ndarray], np.ndarray], n: int, se
 
 def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: int, k: int = 5,
                          initial: int = 50, increment: int = 25, maximum: int = 500,
-                         confidence: float = 0.95) -> tuple[torch.Tensor, dict]:
+                         confidence: float = 0.95,temperature:float=0.10) -> tuple[torch.Tensor, dict]:
     """Training-only multi-view clinical prior projected into visual channel space."""
     z = features.detach().float().cpu().numpy(); clinical = np.asarray(clinical, float)
     n, channels = z.shape; variables = clinical.shape[1]
-    clinical = (clinical - np.nanmean(clinical, 0)) / (np.nanstd(clinical, 0) + 1e-8)
+    clinical_mean=np.nanmean(clinical,0);clinical_std=np.nanstd(clinical,0)
+    clinical = (clinical - clinical_mean) / (clinical_std + 1e-8)
     clinical = np.nan_to_num(clinical)
 
     def clinical_estimate(index):
@@ -129,9 +130,12 @@ def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: 
         return association_views(z[index],clinical[index],k)
 
     projection_result = adaptive_bootstrap(projection_estimate, n, seed + 104729, initial, increment, maximum, confidence)
-    r = projection_result.aggregate
+    r = projection_result.aggregate/float(temperature)
     r = r - r.max(1, keepdims=True); projection = np.exp(r); projection /= projection.sum(1, keepdims=True)
     prior = projection @ a_rel @ projection.T
-    metadata = {"clinical_weights": clinical_result.weights.tolist(), "clinical_bootstraps": clinical_result.iterations,
-                "projection_weights": projection_result.weights.tolist(), "projection_bootstraps": projection_result.iterations}
+    metadata = {"training_samples":int(n),"visual_channels":int(channels),"clinical_variables":int(variables),
+                "clinical_normalization_mean":clinical_mean.tolist(),"clinical_normalization_std":clinical_std.tolist(),
+                "clinical_weights": clinical_result.weights.tolist(), "clinical_bootstraps": clinical_result.iterations,
+                "projection_weights": projection_result.weights.tolist(), "projection_bootstraps": projection_result.iterations,
+                "seed":int(seed),"nmi_neighbors":int(k),"assignment_temperature":float(temperature)}
     return torch.from_numpy(prior).float(), metadata

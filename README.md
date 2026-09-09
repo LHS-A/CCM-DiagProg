@@ -70,6 +70,8 @@ python train.py \
 
 Training first warms up the visual auxiliary heads, constructs and fixes the clinical relation priors, performs prior alignment and task-conditioned channel screening, then freezes the refined visual encoder and trains semantic contextualization and the hypernetwork. All six objectives receive weight `1/6`. Periodic checkpoints are written every 10 epochs and the best Stage-II shared model is saved as `best_model.pt`.
 
+Feature screening is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. The complete per-identity evidence is written to `relation_prior_audit.json` and `channel_screening_audit.json`.
+
 To resume after a completed Stage-I checkpoint:
 
 ```bash
@@ -112,3 +114,5 @@ pytest -q
 ```
 
 The repository intentionally excludes datasets, trained weights, predictions, and experiment-specific result files.
+
+The paper-to-code execution map is provided in `METHOD_REPRODUCTION_AUDIT.md`.

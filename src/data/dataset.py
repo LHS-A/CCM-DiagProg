@@ -30,6 +30,14 @@ class CCMManifestDataset(Dataset):
         self.max_length = max_length
         self.clinical_missingness = clinical_missingness
         self.excluded_clinical_fields = {x.casefold() for x in (excluded_clinical_fields or set())}
+        if clinical_missingness is not None and not 0.0 <= clinical_missingness <= 1.0:
+            raise ValueError("clinical_missingness must lie in [0,1]")
+        def permitted(column: str) -> bool:
+            key=column.casefold();short=key[len("clinical_"):] if key.startswith("clinical_") else key
+            return key not in self.excluded_clinical_fields and short not in self.excluded_clinical_fields
+        self.clinical_structured_columns=tuple(sorted(
+            x for x in self.frame.columns if x.startswith("clinical_") and x!="clinical_text" and permitted(x)
+        ))
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -54,7 +62,7 @@ class CCMManifestDataset(Dataset):
         fields=[x for x in fields if allowed(x.split(":",1)[0])]
         unavailable=(not fields) or text.casefold().startswith("clinical context unavailable")
         q=float(torch.rand(())) if self.clinical_missingness is None else float(self.clinical_missingness)
-        n=round(q*len(fields)); order=torch.randperm(len(fields)).tolist(); removed=set(order[:n]); fields=[x for i,x in enumerate(fields) if i not in removed]
+        n=int(np.floor(q*len(fields)+0.5));order=torch.randperm(len(fields)).tolist();removed=set(order[:n]);fields=[x for i,x in enumerate(fields) if i not in removed]
         available=(not unavailable) and bool(fields); sentence="; ".join(fields) if available else "No clinical context available."
         encoded = self.tokenizer(
             sentence, max_length=self.max_length,
@@ -67,9 +75,7 @@ class CCMManifestDataset(Dataset):
             values = np.asarray([row[x] for x in self.task["targets"]], dtype=np.float32)
             target = torch.from_numpy(np.nan_to_num(values, nan=0.0))
             mask = torch.from_numpy(np.isfinite(values))
-        structured_columns = sorted(x for x in self.frame.columns if x.startswith("clinical_") and x != "clinical_text" and allowed(x))
-        structured = np.asarray([row[x] for x in structured_columns], dtype=np.float32) if structured_columns else np.empty(0, dtype=np.float32)
-        structured = np.nan_to_num(structured, nan=0.0)
+        structured = np.asarray([row[x] for x in self.clinical_structured_columns], dtype=np.float32) if self.clinical_structured_columns else np.empty(0, dtype=np.float32)
         return {
             "image": self._image(row.image_path),
             "input_ids": encoded["input_ids"].squeeze(0),

@@ -31,7 +31,14 @@ model:
   generator_hidden_dim: 256
   task_count: 6
   task_loss_weight: 0.16666666666666666
-  retained_channel_ratio: 0.30
+  retained_channel_ratio:
+    ocular_diag: 0.30
+    systemic_diag: 0.30
+    ocular_reg: 0.30
+    hba1c_reg: 0.30
+    short_term: 0.30
+    long_term: 0.30
+  structural_temperature: 0.10
   structural_loss_weight: 1.0
   hyper_loss_weight: 5.0e-4
   relation_bootstrap_initial: 50
@@ -48,7 +55,7 @@ model:
   kci_gcv_max: 1.0e1
   kci_gcv_candidates: 50
   screening_fdr: 0.05
-  screening_max_patients: 128
+  screening_max_patients: null
 
 training:
   batch_size: 16

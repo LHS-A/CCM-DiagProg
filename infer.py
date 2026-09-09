@@ -36,14 +36,17 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config); task = get_task(cfg, IDENTITY_TASK[args.identity])
     frame = pd.read_csv(args.manifest).reset_index(drop=True)
-    tokenizer = AutoTokenizer.from_pretrained(resolve_cached_model(cfg["model"]["clinical_encoder"]))
-    dataset = CCMManifestDataset(frame, task, tokenizer, int(cfg["data"]["input_resolution"]),
-                                 max_length=int(cfg["model"]["max_sequence_length"]),
-                                 clinical_missingness=args.text_missingness)
+    payload = torch.load(args.checkpoint, map_location="cpu")
+    saved_cfg=payload.get("config",{});model_cfg=saved_cfg.get("model",cfg["model"])
+    tokenizer = AutoTokenizer.from_pretrained(resolve_cached_model(model_cfg["clinical_encoder"]))
+    data_cfg=saved_cfg.get("data",cfg["data"])
+    dataset = CCMManifestDataset(frame, task, tokenizer, int(data_cfg["input_resolution"]),
+                                 max_length=int(model_cfg["max_sequence_length"]),
+                                 clinical_missingness=args.text_missingness,
+                                 excluded_clinical_fields=set(task.get("clinical_exclude",[])))
     loader = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False,
                         num_workers=int(cfg["data"]["num_workers"]), pin_memory=True)
-    payload = torch.load(args.checkpoint, map_location="cpu")
-    model = UnifiedCausalCCM({**cfg["model"], "pretrained_visual": False})
+    model = UnifiedCausalCCM({**model_cfg, "pretrained_visual": False})
     model.load_state_dict(payload["model_state"]); model.eval().to(args.device)
     predictions = []
     with torch.inference_mode():
@@ -67,7 +70,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True); output.to_csv(args.output, index=False)
     rows=[]
     if task['kind']=='classification':
-        y=frame.label.to_numpy(int);prob=np.exp(prediction-prediction.max(1,keepdims=True));prob/=prob.sum(1,keepdims=True);pred=prob.argmax(1);cm=confusion_matrix(y,pred,labels=range(len(names)))
+        y=frame.label.to_numpy(int);prob=probabilities;pred=prob.argmax(1);cm=confusion_matrix(y,pred,labels=range(len(names)))
         for i,name in enumerate(names):
             tp=cm[i,i];fn=cm[i].sum()-tp;fp=cm[:,i].sum()-tp;tn=cm.sum()-tp-fn-fp
             rows.append({'class':name,'ACC':tp/max(tp+fn,1),'AUC':roc_auc_score(y==i,prob[:,i]),'SEN':tp/max(tp+fn,1),'SPE':tn/max(tn+fp,1),'PRE':precision_score(y,pred,labels=[i],average='macro',zero_division=0),'F1':f1_score(y,pred,labels=[i],average='macro',zero_division=0),'Kappa':cohen_kappa_score(y,pred)})

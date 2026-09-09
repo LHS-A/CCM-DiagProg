@@ -16,11 +16,22 @@ from src.utils.huggingface import resolve_cached_model
 from src.utils.io import set_seed
 
 SPECS=[('task1',0,None),('task2',1,None),('task3',2,[1,2,3,4]),('task3',3,[0]),('task4',4,None),('task5',5,None)]
+IDENTITY_NAMES=('ocular_diag','systemic_diag','ocular_reg','hba1c_reg','short_term','long_term')
+
+def task_setting(value,identity):
+    if isinstance(value,dict):
+        name=IDENTITY_NAMES[identity]
+        if name not in value:raise KeyError(f'missing task-specific setting for {name}')
+        return value[name]
+    return value
 
 def make_loaders(cfg,task,path,tokenizer):
-    frame=pd.read_csv(path);result={}
+    frame=pd.read_csv(path);allowed={'train','validation','test'};unknown=set(frame.split.dropna().unique())-allowed
+    if unknown:raise ValueError(f'unsupported split values in {path}: {sorted(unknown)}')
+    result={}
     for split in ('train','validation','test'):
         subset=frame[frame.split.eq(split)].reset_index(drop=True)
+        if split=='train' and subset.empty:raise ValueError(f'{path} has no training partition')
         dataset=CCMManifestDataset(subset,task,tokenizer,int(cfg['data']['input_resolution']),max_length=int(cfg['model']['max_sequence_length']),clinical_missingness=None if split=='train' else float(cfg['model']['clinical_missingness_eval']),excluded_clinical_fields=set(task.get('clinical_exclude',[])))
         result[split]=DataLoader(dataset,batch_size=int(cfg['training']['batch_size']),shuffle=split=='train',num_workers=int(cfg['data']['num_workers']),pin_memory=True)
     return result
@@ -32,7 +43,10 @@ def prediction_loss(pred,target,mask,kind):
 def to_device(batch,device): return {k:v.to(device) for k,v in batch.items() if torch.is_tensor(v)}
 
 def balanced_epoch(model,entries,optimizer,device,stage,cfg):
-    training=optimizer is not None;model.train(training);iterators=[cycle(x['loaders']['train' if training else 'validation']) for x in entries]
+    training=optimizer is not None;model.train(training)
+    if stage==2:
+        model.visual_encoder.eval();model.auxiliary.eval()
+    iterators=[cycle(x['loaders']['train' if training else 'validation']) for x in entries]
     steps=max(len(x['loaders']['train' if training else 'validation']) for x in entries);losses=[]
     context=torch.enable_grad() if training else torch.no_grad()
     with context:
@@ -53,46 +67,61 @@ def balanced_epoch(model,entries,optimizer,device,stage,cfg):
 
 @torch.no_grad()
 def collect_statistics(model,entry,device):
-    model.eval();gap=[];descriptors=[];targets=[];nuisance=[];patients=[]
+    model.eval();gap=[];descriptors=[];targets=[];target_masks=[];nuisance=[];patients=[]
     for batch in entry['loaders']['train']:
         b=to_device(batch,device);feature=model.visual_encoder(b['image']);gap.append(F.adaptive_avg_pool2d(feature,1).flatten(1).cpu())
         descriptors.append(torch.stack((feature.mean((2,3)),feature.amax((2,3))),-1).cpu())
-        targets.append(select(b['target'],entry['indices']).cpu());structured=b['clinical_structured']
+        targets.append(select(b['target'],entry['indices']).cpu());target_masks.append(select(b['target_mask'],entry['indices']).cpu());structured=b['clinical_structured']
         nuisance.append(structured.cpu() if structured.shape[1] else torch.zeros(len(structured),1))
         patients.extend(batch['patient_id'])
-    gap=torch.cat(gap);descriptors=torch.cat(descriptors);targets=torch.cat(targets);nuisance=torch.cat(nuisance)
+    gap=torch.cat(gap);descriptors=torch.cat(descriptors);targets=torch.cat(targets);target_masks=torch.cat(target_masks);nuisance=torch.cat(nuisance)
     # Relation estimation is patient-level so repeated images do not multiply a
     # patient's clinical evidence; image-level samples remain unchanged in SGD.
     unique={name:i for i,name in enumerate(dict.fromkeys(patients))};group=torch.tensor([unique[x] for x in patients]);count=torch.bincount(group,minlength=len(unique)).float()
     def mean_by_patient(value):
         out=torch.zeros((len(unique),)+value.shape[1:],dtype=value.dtype);out.index_add_(0,group,value);return out/count.view((-1,)+(1,)*(value.ndim-1))
-    gap=mean_by_patient(gap);descriptors=mean_by_patient(descriptors);nuisance=mean_by_patient(nuisance)
-    targets=mean_by_patient(targets.float())
-    if entry['task']['kind']=='classification': targets=targets.round().long()
-    return gap,descriptors,targets,nuisance
+    gap=mean_by_patient(gap);descriptors=mean_by_patient(descriptors)
+    def masked_mean_by_patient(value,valid):
+        safe=torch.where(valid,value,torch.zeros_like(value));total=torch.zeros((len(unique),)+value.shape[1:],dtype=value.dtype);number=torch.zeros_like(total)
+        total.index_add_(0,group,safe);number.index_add_(0,group,valid.to(value.dtype));return total/number.clamp_min(1),number>0
+    if nuisance.shape[1]:
+        nuisance,nuisance_valid=masked_mean_by_patient(nuisance,torch.isfinite(nuisance));nuisance=torch.where(nuisance_valid,nuisance,torch.full_like(nuisance,float('nan')))
+        column_mean=torch.nanmean(nuisance,0);column_mean=torch.nan_to_num(column_mean);nuisance=torch.where(torch.isfinite(nuisance),nuisance,column_mean)
+    else:nuisance=mean_by_patient(nuisance)
+    patient_targets=[]
+    for group_id in range(len(unique)):
+        values=targets[group.eq(group_id)]
+        if entry['task']['kind']=='classification' and not bool((values==values[0]).all()):raise ValueError(f'inconsistent labels for patient {list(unique)[group_id]}')
+        patient_targets.append(values.float().mean(0))
+    if entry['task']['kind']=='classification':
+        targets=torch.stack(patient_targets).round().long();valid_patients=torch.ones(len(targets),dtype=torch.bool)
+    else:
+        targets,target_valid=masked_mean_by_patient(targets.float(),target_masks.bool());valid_patients=target_valid.reshape(len(targets),-1).all(1)
+    names=list(unique);keep=torch.where(valid_patients)[0];names=[names[i] for i in keep.tolist()]
+    return gap[keep],descriptors[keep],targets[keep],nuisance[keep],names
 
 def construct_priors(model,entries,device,cfg,seed,out):
     audit={}
     for entry in entries:
-        identity=entry['identity'];gap,descriptors,target,nuisance=collect_statistics(model,entry,device)
+        identity=entry['identity'];gap,descriptors,target,nuisance,patients=collect_statistics(model,entry,device)
         if nuisance.shape[1] == 0 or bool((nuisance.std(0) == 0).all()):
-            audit[str(identity)]={'status':'not_available','reason':'no varying non-target clinical variables'}
-            continue
-        prior,relation_audit=build_relation_prior(gap,nuisance.numpy(),seed=seed+identity*1009,k=int(cfg['model']['nmi_neighbors']),initial=int(cfg['model']['relation_bootstrap_initial']),increment=int(cfg['model']['relation_bootstrap_increment']),maximum=int(cfg['model']['relation_bootstrap_max']),confidence=float(cfg['model']['relation_bootstrap_confidence']))
+            raise RuntimeError(f'{IDENTITY_NAMES[identity]} has no varying training-only non-target clinical variables')
+        prior,relation_audit=build_relation_prior(gap,nuisance.numpy(),seed=seed+identity*1009,k=int(cfg['model']['nmi_neighbors']),initial=int(cfg['model']['relation_bootstrap_initial']),increment=int(cfg['model']['relation_bootstrap_increment']),maximum=int(cfg['model']['relation_bootstrap_max']),confidence=float(cfg['model']['relation_bootstrap_confidence']),temperature=float(cfg['model']['structural_temperature']))
         model.set_prior(identity,prior)
-        audit[str(identity)]=relation_audit
+        audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','patient_ids':patients,**relation_audit}
     (out/'relation_prior_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
 def screen_all(model,entries,device,cfg,seed,out):
     audit={}
     for entry in entries:
-        identity=entry['identity'];_,descriptors,target,nuisance=collect_statistics(model,entry,device)
-        full_n=len(descriptors);maximum=int(cfg['model'].get('screening_max_patients',128))
+        identity=entry['identity'];_,descriptors,target,nuisance,patients=collect_statistics(model,entry,device)
+        full_n=len(descriptors);configured=cfg['model'].get('screening_max_patients');maximum=full_n if configured is None else int(configured)
         if full_n>maximum:
             generator=torch.Generator().manual_seed(seed+identity*3037)
             chosen=torch.randperm(full_n,generator=generator)[:maximum]
-            descriptors,target,nuisance=descriptors[chosen],target[chosen],nuisance[chosen]
-        selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',float(cfg['model']['retained_channel_ratio']),float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_min=int(cfg['model']['permutation_min']),permutation_max=int(cfg['model']['permutation_max']),permutation_confidence=float(cfg['model']['permutation_confidence']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
-        model.set_channels(identity,selected);audit[str(identity)]={'screening':details,'selected_channels':selected.cpu().tolist(),'available_patients':full_n,'screening_patients':len(descriptors),'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement'}
+            descriptors,target,nuisance=descriptors[chosen],target[chosen],nuisance[chosen];patients=[patients[i] for i in chosen.tolist()]
+        rho=float(task_setting(cfg['model']['retained_channel_ratio'],identity))
+        selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_min=int(cfg['model']['permutation_min']),permutation_max=int(cfg['model']['permutation_max']),permutation_confidence=float(cfg['model']['permutation_confidence']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
+        model.set_channels(identity,selected);audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','target_representation_shape':list(target.shape),'nuisance_shape':list(nuisance.shape),'rho_t':rho,'selected_channels':selected.cpu().tolist(),'selected_feature_dim':len(selected),'available_patients':full_n,'screening_patients':len(descriptors),'patient_ids':patients,'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement','screening':details}
     (out/'channel_screening_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
 
 def save(model,cfg,history,path,epoch):torch.save({'model_state':model.state_dict(),'config':cfg,'history':history,'global_epoch':epoch},path)
@@ -104,23 +133,24 @@ def main():
     entries=[]
     for task_id,identity,indices in SPECS:
         task=get_task(cfg,task_id);entries.append({'task':task,'identity':identity,'indices':indices,'loaders':make_loaders(cfg,task,args.manifests_dir/f'{task_id}.csv',tokenizer)})
-    history=[];epoch=0;optimizer=torch.optim.AdamW(model.parameters(),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
+    history=[];epoch=0;model.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
     warmup=int(cfg['training']['visual_warmup_epochs']);stage1=int(cfg['training']['stage1_epochs'])
     if args.resume_stage1:
-        checkpoint=torch.load(args.resume_stage1,map_location=device);model.load_state_dict(checkpoint['model_state']);history=checkpoint.get('history',[]);epoch=int(checkpoint.get('global_epoch',stage1))
-    for local in range(1,warmup+1) if not args.resume_stage1 else ():
-        epoch+=1;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'warmup','train_loss':tr,'validation_loss':va})
+        checkpoint=torch.load(args.resume_stage1,map_location=device);model.load_state_dict(checkpoint['model_state']);model.set_stage_trainability(1);history=checkpoint.get('history',[]);epoch=int(checkpoint.get('global_epoch',0))
+    for target_epoch in range(epoch+1,warmup+1):
+        epoch=target_epoch;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'warmup','train_loss':tr,'validation_loss':va})
         print(history[-1],flush=True)
         if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch)
-    if not args.resume_stage1:
-        save(model,cfg,history,args.output/'stage1_warmup_complete.pt',epoch)
+    if epoch==warmup:save(model,cfg,history,args.output/'stage1_warmup_complete.pt',epoch)
+    if not all(bool(prior.prior_ready) for prior in model.structural_priors):
+        if epoch<warmup:raise RuntimeError('structural prior construction requires completed visual warm-up')
         construct_priors(model,entries,device,cfg,args.seed,args.output)
-    for local in range(warmup+1,stage1+1) if not args.resume_stage1 else ():
-        epoch+=1;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'prior_alignment','train_loss':tr,'validation_loss':va})
+    for target_epoch in range(max(epoch+1,warmup+1),stage1+1):
+        epoch=target_epoch;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'prior_alignment','train_loss':tr,'validation_loss':va})
         print(history[-1],flush=True)
         if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch)
     screen_all(model,entries,device,cfg,args.seed,args.output)
-    for p in model.visual_encoder.parameters():p.requires_grad=False
+    model.set_stage_trainability(2)
     optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']));best=float('inf');stale=0
     for local in range(1,int(cfg['training']['max_epochs'])-stage1+1):
         epoch+=1;tr=balanced_epoch(model,entries,optimizer,device,2,cfg);va=balanced_epoch(model,entries,None,device,2,cfg);history.append({'epoch':epoch,'stage':'semantic_hypernetwork','train_loss':tr,'validation_loss':va});print(history[-1],flush=True)
