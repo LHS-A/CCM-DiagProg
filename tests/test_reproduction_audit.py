@@ -193,3 +193,11 @@ def test_latest_paper_defaults_and_absolute_one_month_targets(tmp_path):
     manifest=regression_manifest(tmp_path,{'id':'task4','targets':expected},'unused')
     assert manifest.loc[0,expected].tolist()==[1.,6.,8.,10.]
     assert all(bool(manifest.loc[0,f'target_valid_{name}']) for name in expected)
+
+
+def test_public_model_api_exposes_only_the_unified_method():
+    import src.models as public_models
+
+    assert public_models.__all__ == ["ResNet50Features", "StructuralPrior", "UnifiedCausalCCM"]
+    assert not hasattr(public_models, "CausalCCM")
+    assert not hasattr(public_models, "build_model")

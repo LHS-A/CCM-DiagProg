@@ -1,5 +1,8 @@
 # CCM-DiagProg
 
+`UnifiedCausalCCM` is the public end-to-end model API used by every official
+training and inference entry point for the shared six-task framework.
+
 Official implementation of the unified Causal-CCM framework for diagnosis, clinical metric regression, and prognosis from corneal confocal microscopy images.
 
 ## Tasks

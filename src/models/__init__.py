@@ -1,4 +1,4 @@
-from src.models.causal_ccm import CausalCCM, build_model
+from src.models.causal_ccm import ResNet50Features, StructuralPrior
 from src.models.unified_causal_ccm import UnifiedCausalCCM
 
-__all__ = ["CausalCCM", "build_model", "UnifiedCausalCCM"]
+__all__ = ["ResNet50Features", "StructuralPrior", "UnifiedCausalCCM"]
