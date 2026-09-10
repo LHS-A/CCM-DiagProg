@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 from __future__ import annotations
-import argparse,json
+import argparse,json,math
 from itertools import cycle
 from pathlib import Path
 import numpy as np,pandas as pd,torch
@@ -25,14 +25,26 @@ def task_setting(value,identity):
         return value[name]
     return value
 
-def make_loaders(cfg,task,path,tokenizer):
+def task_exclusions(task,identity):
+    """Resolve the paper's target/future/proxy mask for one task identity."""
+    configured=task.get('clinical_exclude_by_identity',{})
+    return set(configured.get(IDENTITY_NAMES[identity],task.get('clinical_exclude',[])))
+
+def validate_patient_partition(frame,path):
+    groups={name:set(frame.loc[frame.split.eq(name),'patient_id'].astype(str)) for name in ('train','validation','test')}
+    overlaps={(a,b):sorted(groups[a]&groups[b]) for a,b in (('train','validation'),('train','test'),('validation','test'))}
+    bad={f'{a}/{b}':ids[:10] for (a,b),ids in overlaps.items() if ids}
+    if bad:raise ValueError(f'patient leakage in {path}: {bad}')
+
+def make_loaders(cfg,task,path,tokenizer,identity):
     frame=pd.read_csv(path);allowed={'train','validation','test'};unknown=set(frame.split.dropna().unique())-allowed
     if unknown:raise ValueError(f'unsupported split values in {path}: {sorted(unknown)}')
+    validate_patient_partition(frame,path)
     result={}
     for split in ('train','validation','test'):
         subset=frame[frame.split.eq(split)].reset_index(drop=True)
         if split=='train' and subset.empty:raise ValueError(f'{path} has no training partition')
-        dataset=CCMManifestDataset(subset,task,tokenizer,int(cfg['data']['input_resolution']),max_length=int(cfg['model']['max_sequence_length']),clinical_missingness=None if split=='train' else float(cfg['model']['clinical_missingness_eval']),excluded_clinical_fields=set(task.get('clinical_exclude',[])))
+        dataset=CCMManifestDataset(subset,task,tokenizer,int(cfg['data']['input_resolution']),max_length=int(cfg['model']['max_sequence_length']),clinical_missingness=None if split=='train' else float(cfg['model']['clinical_missingness_eval']),excluded_clinical_fields=task_exclusions(task,identity),partition=split)
         result[split]=DataLoader(dataset,batch_size=int(cfg['training']['batch_size']),shuffle=split=='train',num_workers=int(cfg['data']['num_workers']),pin_memory=True)
     return result
 def select(tensor,indices): return tensor if indices is None else tensor[:,indices]
@@ -69,6 +81,7 @@ def balanced_epoch(model,entries,optimizer,device,stage,cfg):
 def collect_statistics(model,entry,device):
     model.eval();gap=[];descriptors=[];targets=[];target_masks=[];nuisance=[];patients=[]
     for batch in entry['loaders']['train']:
+        if set(batch['data_partition'])!={'train'}:raise RuntimeError(f"non-training data reached statistics for {IDENTITY_NAMES[entry['identity']]}")
         b=to_device(batch,device);feature=model.visual_encoder(b['image']);gap.append(F.adaptive_avg_pool2d(feature,1).flatten(1).cpu())
         descriptors.append(torch.stack((feature.mean((2,3)),feature.amax((2,3))),-1).cpu())
         targets.append(select(b['target'],entry['indices']).cpu());target_masks.append(select(b['target_mask'],entry['indices']).cpu());structured=b['clinical_structured']
@@ -122,9 +135,17 @@ def screen_all(model,entries,device,cfg,seed,out):
         rho=float(task_setting(cfg['model']['retained_channel_ratio'],identity))
         selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_min=int(cfg['model']['permutation_min']),permutation_max=int(cfg['model']['permutation_max']),permutation_confidence=float(cfg['model']['permutation_confidence']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
         model.set_channels(identity,selected);audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','target_representation_shape':list(target.shape),'nuisance_shape':list(nuisance.shape),'rho_t':rho,'selected_channels':selected.cpu().tolist(),'selected_feature_dim':len(selected),'available_patients':full_n,'screening_patients':len(descriptors),'patient_ids':patients,'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement','screening':details}
+        task_dir=out/'screening'/IDENTITY_NAMES[identity];task_dir.mkdir(parents=True,exist_ok=True)
+        files={'hsic_statistics':details['hsic_statistics'],'hsic_pvalues':details['hsic_p'],'hsic_rejected':details['hsic_rejected'],'kci_statistics':details['kci_statistics'],'kci_pvalues':details['kci_p'],'kci_rejected':details['kci_rejected'],'retention_ratio':rho,'selected_channels':selected.cpu().tolist()}
+        for name,value in files.items():(task_dir/f'{name}.json').write_text(json.dumps(value,indent=2)+'\n')
     (out/'channel_screening_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
 
 def save(model,cfg,history,path,epoch):torch.save({'model_state':model.state_dict(),'config':cfg,'history':history,'global_epoch':epoch},path)
+def learning_rate(cfg,epoch):
+    base=float(cfg['training']['learning_rate']);minimum=float(cfg['training']['min_learning_rate']);maximum=int(cfg['training']['max_epochs'])
+    return minimum+(base-minimum)*.5*(1+math.cos(math.pi*min(epoch,maximum)/maximum))
+def set_learning_rate(optimizer,value):
+    for group in optimizer.param_groups:group['lr']=value
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,default=Path('configs/default.yaml'));parser.add_argument('--manifests-dir',type=Path,required=True);parser.add_argument('--output',type=Path,default=Path('checkpoints/unified_six_task'));parser.add_argument('--seed',type=int,default=3407);parser.add_argument('--resume-stage1',type=Path);args=parser.parse_args()
     cfg=load_config(args.config);set_seed(args.seed,True)
@@ -132,13 +153,13 @@ def main():
     device=torch.device('cuda');tokenizer=AutoTokenizer.from_pretrained(resolve_cached_model(cfg['model']['clinical_encoder']));model=UnifiedCausalCCM(cfg['model']).to(device);args.output.mkdir(parents=True,exist_ok=True)
     entries=[]
     for task_id,identity,indices in SPECS:
-        task=get_task(cfg,task_id);entries.append({'task':task,'identity':identity,'indices':indices,'loaders':make_loaders(cfg,task,args.manifests_dir/f'{task_id}.csv',tokenizer)})
+        task=get_task(cfg,task_id);entries.append({'task':task,'identity':identity,'indices':indices,'loaders':make_loaders(cfg,task,args.manifests_dir/f'{task_id}.csv',tokenizer,identity)})
     history=[];epoch=0;model.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
     warmup=int(cfg['training']['visual_warmup_epochs']);stage1=int(cfg['training']['stage1_epochs'])
     if args.resume_stage1:
         checkpoint=torch.load(args.resume_stage1,map_location=device);model.load_state_dict(checkpoint['model_state']);model.set_stage_trainability(1);history=checkpoint.get('history',[]);epoch=int(checkpoint.get('global_epoch',0))
     for target_epoch in range(epoch+1,warmup+1):
-        epoch=target_epoch;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'warmup','train_loss':tr,'validation_loss':va})
+        epoch=target_epoch;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'warmup','learning_rate':lr,'train_loss':tr,'validation_loss':va})
         print(history[-1],flush=True)
         if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch)
     if epoch==warmup:save(model,cfg,history,args.output/'stage1_warmup_complete.pt',epoch)
@@ -146,14 +167,14 @@ def main():
         if epoch<warmup:raise RuntimeError('structural prior construction requires completed visual warm-up')
         construct_priors(model,entries,device,cfg,args.seed,args.output)
     for target_epoch in range(max(epoch+1,warmup+1),stage1+1):
-        epoch=target_epoch;tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'prior_alignment','train_loss':tr,'validation_loss':va})
+        epoch=target_epoch;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'prior_alignment','learning_rate':lr,'train_loss':tr,'validation_loss':va})
         print(history[-1],flush=True)
         if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch)
     screen_all(model,entries,device,cfg,args.seed,args.output)
     model.set_stage_trainability(2)
     optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']));best=float('inf');stale=0
     for local in range(1,int(cfg['training']['max_epochs'])-stage1+1):
-        epoch+=1;tr=balanced_epoch(model,entries,optimizer,device,2,cfg);va=balanced_epoch(model,entries,None,device,2,cfg);history.append({'epoch':epoch,'stage':'semantic_hypernetwork','train_loss':tr,'validation_loss':va});print(history[-1],flush=True)
+        epoch+=1;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,2,cfg);va=balanced_epoch(model,entries,None,device,2,cfg);history.append({'epoch':epoch,'stage':'semantic_hypernetwork','learning_rate':lr,'train_loss':tr,'validation_loss':va});print(history[-1],flush=True)
         if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch)
         if va<best-float(cfg['training']['early_stopping']['min_delta']):best=va;stale=0;save(model,cfg,history,args.output/'best_model.pt',epoch)
         else:stale+=1

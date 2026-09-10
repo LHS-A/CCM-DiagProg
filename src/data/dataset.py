@@ -21,6 +21,7 @@ class CCMManifestDataset(Dataset):
         max_length: int = 128,
         clinical_missingness: float | None = None,
         excluded_clinical_fields: Optional[set[str]] = None,
+        partition: Optional[str] = None,
     ) -> None:
         self.frame = frame.reset_index(drop=True)
         self.task = task
@@ -30,6 +31,10 @@ class CCMManifestDataset(Dataset):
         self.max_length = max_length
         self.clinical_missingness = clinical_missingness
         self.excluded_clinical_fields = {x.casefold() for x in (excluded_clinical_fields or set())}
+        inferred=set(self.frame["split"].dropna().astype(str)) if "split" in self.frame else set()
+        self.partition=partition or (next(iter(inferred)) if len(inferred)==1 else "unspecified")
+        if partition is not None and inferred and inferred != {partition}:
+            raise ValueError(f"Dataset provenance mismatch: declared {partition!r}, rows contain {sorted(inferred)}")
         if clinical_missingness is not None and not 0.0 <= clinical_missingness <= 1.0:
             raise ValueError("clinical_missingness must lie in [0,1]")
         def permitted(column: str) -> bool:
@@ -86,4 +91,5 @@ class CCMManifestDataset(Dataset):
             "clinical_structured": torch.from_numpy(structured),
             "patient_id": str(row.patient_id),
             "image_path": str(row.image_path),
+            "data_partition": self.partition,
         }

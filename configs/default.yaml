@@ -118,6 +118,9 @@ tasks:
     secondary_metric: normalized_rmse
     maximize: false
     clinical_exclude: [HbA1c, CFS, TBUT, SIT, OSDI]
+    clinical_exclude_by_identity:
+      ocular_reg: [CFS, TBUT, SIT, OSDI, followup_CFS, followup_TBUT, followup_SIT, followup_OSDI]
+      hba1c_reg: [HbA1c, glucose, fasting_glucose, random_glucose, estimated_average_glucose]
   task4:
     name: Short-term treatment prognosis
     kind: regression

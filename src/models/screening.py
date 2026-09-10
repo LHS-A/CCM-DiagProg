@@ -63,18 +63,29 @@ def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alph
         permutations=torch.stack([torch.randperm(n,generator=rng,device=device) for _ in range(count)])
         pky=torch.stack([ky[p][:,p] for p in permutations]);return torch.einsum('cij,pij->pc',kx,pky)/max((n-1)**2,1)
     hp_t,hn_t=_sequential_many(hs,hnull,permutation_min,permutation_max,permutation_confidence,boundary)
-    joint=_center_batch(kx*kz);rx=torch.einsum('ij,cjk,kl->cil',residual,joint,residual);ry=residual@ky@residual;ks=(rx*ry.T).sum((-2,-1))/n
+    hsic_rejected=_bh(hp_t,alpha);candidates_idx=torch.where(hsic_rejected)[0]
+    if not len(candidates_idx):
+        raise RuntimeError('HSIC produced no target-relevant candidate channels')
+    # Paper order is strict: KCI is evaluated and multiplicity-corrected only
+    # inside the HSIC candidate family, not over all visual channels.
+    candidate_kx=kx.index_select(0,candidates_idx)
+    joint=_center_batch(candidate_kx*kz);rx=torch.einsum('ij,cjk,kl->cil',residual,joint,residual);ry=residual@ky@residual;candidate_ks=(rx*ry.T).sum((-2,-1))/n
     def knull(count):
         permutations=torch.stack([torch.randperm(n,generator=rng,device=device) for _ in range(count)])
         pry=torch.stack([residual@ky[p][:,p]@residual for p in permutations]);return torch.einsum('cij,pji->pc',rx,pry)/n
-    kp_t,kn_t=_sequential_many(ks,knull,permutation_min,permutation_max,permutation_confidence,boundary)
-    hsic_rejected=_bh(hp_t,alpha);kci_rejected=_bh(kp_t,alpha);significant=hsic_rejected&kci_rejected;indices=torch.where(significant)[0]
+    kp_candidate,kn_candidate=_sequential_many(candidate_ks,knull,permutation_min,permutation_max,permutation_confidence,alpha/len(candidates_idx))
+    candidate_rejected=_bh(kp_candidate,alpha)
+    kp_t=torch.full((channels,),float('nan'),device=device);kp_t[candidates_idx]=kp_candidate
+    kn_t=torch.zeros(channels,dtype=torch.long,device=device);kn_t[candidates_idx]=kn_candidate
+    ks=torch.full((channels,),float('-inf'),device=device);ks[candidates_idx]=candidate_ks
+    kci_rejected=torch.zeros(channels,dtype=torch.bool,device=device);kci_rejected[candidates_idx]=candidate_rejected
+    significant=hsic_rejected&kci_rejected;indices=torch.where(significant)[0]
     budget=max(1,round(channels*retention_ratio));ks_t=ks
     if not len(indices):raise RuntimeError('HSIC/KCI intersection is empty for this task; no non-significant fallback is permitted')
     if len(indices)>budget: indices=indices[torch.topk(ks_t[indices],budget).indices]
     ranking=torch.argsort(ks_t,descending=True)
     details={'lambda_kci':float(lam),'descriptor_bandwidths':bandwidth.cpu().tolist(),'nuisance_bandwidth':float(nuisance_bandwidth),
-             'target_kernel':'label' if categorical else 'rbf_median_heuristic','hsic_statistics':hs.cpu().tolist(),'kci_statistics':ks.cpu().tolist(),
+             'target_kernel':'label' if categorical else 'rbf_median_heuristic','hsic_statistics':hs.cpu().tolist(),'hsic_candidates':candidates_idx.cpu().tolist(),'kci_candidate_count':len(candidates_idx),'kci_statistics':ks.cpu().tolist(),
              'hsic_p':hp_t.cpu().tolist(),'kci_p':kp_t.cpu().tolist(),'hsic_rejected':hsic_rejected.cpu().tolist(),
              'kci_rejected':kci_rejected.cpu().tolist(),'significant_intersection':significant.cpu().tolist(),
              'conditional_ranking':ranking.cpu().tolist(),'hsic_permutations':hn_t.cpu().tolist(),'kci_permutations':kn_t.cpu().tolist(),

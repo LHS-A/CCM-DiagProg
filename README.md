@@ -1,30 +1,19 @@
 # CCM-DiagProg
 
-Official PyTorch implementation of the unified prior-guided and patient-adaptive framework for corneal confocal microscopy analysis.
+Official implementation of the unified Causal-CCM framework for diagnosis, clinical metric regression, and prognosis from corneal confocal microscopy images.
 
-The model jointly supports six clinical objectives through one shared visual encoder, Tiny ClinicalBERT semantic encoder, task-conditioned feature subsets, shared hypernetwork, and task-specific parameter generators. The default `nlpie/tiny-clinicalbert` output is projected from 312 to the framework's fixed 768-dimensional patient-semantic space.
+## Tasks
 
-| Identity | Objective | Output |
+| Identity | Task | Output |
 |---:|---|---|
-| 0 | Ocular neuroimmune diagnosis | HC, DED, NCP |
-| 1 | Systemic small-fiber neuropathy diagnosis | HC, NODPN, DPN |
-| 2 | Ocular clinical metric regression | CFS, TBUT, SIT, OSDI |
+| 0 | Ocular-surface diagnosis | HC, DED, NCP |
+| 1 | Systemic neuropathy diagnosis | HC, NODPN, DPN |
+| 2 | Ocular-surface metric regression | CFS, TBUT, SIT, OSDI |
 | 3 | Glycemic metric regression | HbA1c |
-| 4 | One-month treatment prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
-| 5 | Six-month postoperative prognosis | Non-persistent, Persistent |
+| 4 | One-month prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
+| 5 | Six-month prognosis | Non-persistent, Persistent |
 
-## Method
-
-The implementation contains:
-
-- min–max-normalized visual relation modeling and prior-guided off-diagonal alignment;
-- Pearson, Spearman, distance-correlation, and k-NN normalized mutual-information clinical relations;
-- adaptive bootstrap stability weighting and clinical-to-visual prior projection;
-- task-conditioned HSIC relevance and KCI conditional-robustness screening with GCV, sequential permutation testing, and Benjamini–Hochberg correction;
-- leakage-controlled clinical serialization and stochastic clinical-context dropout;
-- eight-head semantic-to-visual cross-attention;
-- a shared `800 → 512 → 256` hypernetwork and six task-specific dynamic parameter generators;
-- two-stage, equally weighted joint optimization across all six task identities.
+All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements adaptive multi-view clinical relation priors, prior-guided visual alignment, sequential-permutation HSIC/KCI channel screening with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
 
 ## Installation
 
@@ -34,53 +23,55 @@ conda activate ccm-diagprog
 pip install -e .
 ```
 
-Tiny ClinicalBERT and ImageNet-pretrained ResNet-50 weights are downloaded through their standard Hugging Face and torchvision interfaces when they are not already cached.
+## Manifest format
 
-## Data manifests
-
-Prepare five CSV manifests in one directory:
-
-```text
-task1.csv
-task2.csv
-task3.csv
-task4.csv
-task5.csv
-```
-
-Every manifest contains:
+Prepare `task1.csv` through `task5.csv` in one manifest directory. Each CSV contains:
 
 ```text
 image_path,patient_id,split,clinical_text
 ```
 
-`split` must be `train`, `validation`, or `test`. Classification manifests additionally contain `label` and `class_name`. Regression manifests contain the target columns declared in `configs/default.yaml`. Structured clinical fields use the `clinical_` prefix. Direct targets, future variables, and label-construction proxies must be listed under each task's `clinical_exclude` configuration.
+`split` is `train`, `validation`, or `test`. Classification manifests also contain `label` and `class_name`. Regression manifests contain the target columns defined in `configs/default.yaml`.
 
-Task 3 is divided into identities 2 and 3 while sharing the same manifest.
+Task 3 supplies two shared-model identities: ocular-surface regression and HbA1c regression.
+All rows belonging to one patient must occur in exactly one partition. The
+trainer rejects any patient overlap. Non-target structured clinical variables
+used by the relation prior use the `clinical_` prefix. Target, future and proxy
+fields are excluded by the identity-specific rules in `configs/default.yaml`.
 
 ## Training
 
-```bash
-python train.py \
-  --config configs/default.yaml \
-  --manifests-dir /path/to/manifests \
-  --output checkpoints/unified_six_task \
-  --seed 3407
-```
-
-Training first warms up the visual auxiliary heads, constructs and fixes the clinical relation priors, performs prior alignment and task-conditioned channel screening, then freezes the refined visual encoder and trains semantic contextualization and the hypernetwork. All six objectives receive weight `1/6`. Periodic checkpoints are written every 10 epochs and the best Stage-II shared model is saved as `best_model.pt`.
-
-Feature screening is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. The complete per-identity evidence is written to `relation_prior_audit.json` and `channel_screening_audit.json`.
-
-To resume after a completed Stage-I checkpoint:
+Train the six identities sequentially in one shared model:
 
 ```bash
 python train.py \
   --config configs/default.yaml \
   --manifests-dir /path/to/manifests \
-  --output checkpoints/unified_six_task \
-  --resume-stage1 checkpoints/unified_six_task/epoch_0030.pt
+  --output checkpoints/unified_six_task
 ```
+
+The trainer saves `best_model.pt`, periodic checkpoints every 10 epochs, and
+JSON audits for relation-prior construction and channel screening. AdamW uses
+the paper's cosine schedule from `1e-4` to `1e-6`.
+
+Feature screening is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. KCI is run and BH-corrected only inside the corresponding HSIC candidate family. The complete evidence is written to `relation_prior_audit.json`, `channel_screening_audit.json`, and `screening/<identity>/`.
+
+Run all five patient-level folds (test fold, following validation fold, and
+three training folds) with:
+
+```bash
+python scripts/train_unified_five_folds.py \
+  --source-manifests /path/to/base_manifests \
+  --work-dir artifacts/unified_five_folds \
+  --output checkpoints/unified_five_folds
+```
+
+Every fold launches a new shared model and independently reconstructs its
+training-only relation priors, kernels, permutation tests and six channel sets.
+
+Resume a completed Stage-1 run with `--resume-stage1 <checkpoint>`. The
+checkpoint stores all six priors and all six independently selected channel
+sets; legacy shared-mask checkpoints are intentionally rejected.
 
 ## Inference
 
@@ -90,12 +81,11 @@ python infer.py \
   --manifest /path/to/test.csv \
   --checkpoint checkpoints/unified_six_task/best_model.pt \
   --identity 0 \
-  --text-missingness 0.0 \
   --output predictions.csv \
   --metrics metrics.csv
 ```
 
-Clinical-context availability can be evaluated without changing the model:
+Text-missing evaluation is controlled with `--text-missingness`:
 
 ```bash
 python infer.py ... --text-missingness 0.0
@@ -103,16 +93,26 @@ python infer.py ... --text-missingness 0.5
 python infer.py ... --text-missingness 1.0
 ```
 
+Identity indices are zero-based and follow the task table above.
+
 ## Inference complexity
 
 For one 384×384 image and 128 Tiny ClinicalBERT tokens, the complete inference deployment contains 43.291 M parameters and requires 25.906 GFLOPs (`1 MAC = 2 FLOPs`).
 
-## Tests
+## Test
 
 ```bash
+python -m compileall train.py infer.py src scripts
 pytest -q
+python scripts/smoke_unified_real_data.py --device cuda
 ```
 
-The repository intentionally excludes datasets, trained weights, predictions, and experiment-specific result files.
+The smoke test reads real Task-3 training images and executes reduced-cost
+Stage 1, prior construction, HSIC, candidate-only KCI, channel fixation, Stage
+2 backward, checkpoint reload and inference. It never modifies dataset files.
 
-The paper-to-code execution map is provided in `METHOD_REPRODUCTION_AUDIT.md`.
+The formula-level execution map and expected artifact structure are documented
+in `PAPER_CODE_AUDIT.md` and `METHOD_REPRODUCTION_AUDIT.md`.
+
+Datasets, patient records, trained checkpoints, predictions, caches and private
+experiment outputs are intentionally excluded from the public repository.

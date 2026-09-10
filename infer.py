@@ -21,6 +21,11 @@ from src.utils.huggingface import resolve_cached_model
 
 IDENTITY_TASK = {0: "task1", 1: "task2", 2: "task3", 3: "task3", 4: "task4", 5: "task5"}
 IDENTITY_TARGETS = {2: ["CFS", "TBUT", "SIT", "OSDI"], 3: ["HbA1c"]}
+IDENTITY_NAMES = ("ocular_diag","systemic_diag","ocular_reg","hba1c_reg","short_term","long_term")
+
+def task_exclusions(task,identity):
+    configured=task.get("clinical_exclude_by_identity",{})
+    return set(configured.get(IDENTITY_NAMES[identity],task.get("clinical_exclude",[])))
 
 
 def main():
@@ -43,7 +48,7 @@ def main():
     dataset = CCMManifestDataset(frame, task, tokenizer, int(data_cfg["input_resolution"]),
                                  max_length=int(model_cfg["max_sequence_length"]),
                                  clinical_missingness=args.text_missingness,
-                                 excluded_clinical_fields=set(task.get("clinical_exclude",[])))
+                                 excluded_clinical_fields=task_exclusions(task,args.identity))
     loader = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False,
                         num_workers=int(cfg["data"]["num_workers"]), pin_memory=True)
     model = UnifiedCausalCCM({**model_cfg, "pretrained_visual": False})
