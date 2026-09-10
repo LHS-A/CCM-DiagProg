@@ -22,6 +22,7 @@ class CCMManifestDataset(Dataset):
         clinical_missingness: float | None = None,
         excluded_clinical_fields: Optional[set[str]] = None,
         partition: Optional[str] = None,
+        relation_clinical_fields: Optional[list[str]] = None,
     ) -> None:
         self.frame = frame.reset_index(drop=True)
         self.task = task
@@ -40,9 +41,27 @@ class CCMManifestDataset(Dataset):
         def permitted(column: str) -> bool:
             key=column.casefold();short=key[len("clinical_"):] if key.startswith("clinical_") else key
             return key not in self.excluded_clinical_fields and short not in self.excluded_clinical_fields
-        self.clinical_structured_columns=tuple(sorted(
+        nuisance_columns=tuple(sorted(
             x for x in self.frame.columns if x.startswith("clinical_") and x!="clinical_text" and permitted(x)
         ))
+        def encode(columns):
+            arrays=[];names=[]
+            for column in columns:
+                if column not in self.frame:continue
+                source=self.frame[column];numeric=pd.to_numeric(source,errors="coerce")
+                present=source.notna() & source.astype(str).str.strip().ne("")
+                if int(numeric.notna().sum())==int(present.sum()):
+                    arrays.append(numeric.to_numpy(np.float32)[:,None]);names.append(column)
+                else:
+                    categories=sorted(source[present].astype(str).unique())
+                    for category in categories:
+                        value=np.where(~present,np.nan,(source.astype(str)==category).astype(float)).astype(np.float32)
+                        arrays.append(value[:,None]);names.append(f"{column}={category}")
+            matrix=np.concatenate(arrays,axis=1) if arrays else np.empty((len(self.frame),0),dtype=np.float32)
+            return tuple(names),matrix
+        self.clinical_structured_columns,self._nuisance_matrix=encode(nuisance_columns)
+        relation_fields=list(dict.fromkeys(relation_clinical_fields or nuisance_columns))
+        self.clinical_relation_columns,self._relation_matrix=encode(relation_fields)
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -66,8 +85,11 @@ class CCMManifestDataset(Dataset):
             return key not in self.excluded_clinical_fields and short not in self.excluded_clinical_fields
         fields=[x for x in fields if allowed(x.split(":",1)[0])]
         unavailable=(not fields) or text.casefold().startswith("clinical context unavailable")
-        q=float(torch.rand(())) if self.clinical_missingness is None else float(self.clinical_missingness)
-        n=int(np.floor(q*len(fields)+0.5));order=torch.randperm(len(fields)).tolist();removed=set(order[:n]);fields=[x for i,x in enumerate(fields) if i not in removed]
+        if self.clinical_missingness is None:
+            n=int(torch.randint(0,len(fields)+1,()).item())
+        else:
+            n=int(np.floor(float(self.clinical_missingness)*len(fields)+0.5))
+        order=torch.randperm(len(fields)).tolist();removed=set(order[:n]);fields=[x for i,x in enumerate(fields) if i not in removed]
         available=(not unavailable) and bool(fields); sentence="; ".join(fields) if available else "No clinical context available."
         encoded = self.tokenizer(
             sentence, max_length=self.max_length,
@@ -80,7 +102,8 @@ class CCMManifestDataset(Dataset):
             values = np.asarray([row[x] for x in self.task["targets"]], dtype=np.float32)
             target = torch.from_numpy(np.nan_to_num(values, nan=0.0))
             mask = torch.from_numpy(np.isfinite(values))
-        structured = np.asarray([row[x] for x in self.clinical_structured_columns], dtype=np.float32) if self.clinical_structured_columns else np.empty(0, dtype=np.float32)
+        structured=self._nuisance_matrix[index]
+        relation=self._relation_matrix[index]
         return {
             "image": self._image(row.image_path),
             "input_ids": encoded["input_ids"].squeeze(0),
@@ -89,6 +112,7 @@ class CCMManifestDataset(Dataset):
             "target": target,
             "target_mask": mask,
             "clinical_structured": torch.from_numpy(structured),
+            "clinical_relation": torch.from_numpy(relation),
             "patient_id": str(row.patient_id),
             "image_path": str(row.image_path),
             "data_partition": self.partition,

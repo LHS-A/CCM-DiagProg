@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
+import hashlib
 
 import numpy as np
 import torch
@@ -86,8 +87,8 @@ class BootstrapResult:
 
 
 def adaptive_bootstrap(estimator: Callable[[np.ndarray], np.ndarray], n: int, seed: int,
-                       initial: int = 50, increment: int = 25, maximum: int = 500,
-                       confidence: float = 0.95) -> BootstrapResult:
+                       initial: int = 1000, increment: int = 1000, maximum: int = 1000,
+                       confidence: float = 0.95, off_diagonal: bool = False) -> BootstrapResult:
     rng = np.random.default_rng(seed); estimates: list[np.ndarray] = []; previous = None
     z = 1.959963984540054 if confidence == 0.95 else 2.5758293035489004
     target = initial
@@ -98,10 +99,15 @@ def adaptive_bootstrap(estimator: Callable[[np.ndarray], np.ndarray], n: int, se
             estimates.extend(Parallel(n_jobs=min(8,needed),prefer='threads')(delayed(estimator)(index) for index in indices))
         stack = np.stack(estimates)
         # Variance of each relation view across bootstrap replicates.
-        per_view = stack.reshape(len(stack), -1, stack.shape[-1]).var(0, ddof=1).mean(0)
+        entries=stack.reshape(len(stack),-1,stack.shape[-1])
+        if off_diagonal:
+            if stack.shape[1]!=stack.shape[2]:raise ValueError('off-diagonal bootstrap requires square relation matrices')
+            mask=~np.eye(stack.shape[1],dtype=bool).reshape(-1);entries=entries[:,mask]
+            if not entries.shape[1]:raise ValueError('at least two clinical variables are required')
+        per_view = entries.var(0, ddof=1).mean(0)
         weights = np.exp(-per_view - np.max(-per_view)); weights /= weights.sum()
         aggregate = np.tensordot(stack.mean(0), weights, axes=([-1], [0]))
-        weight_samples = np.exp(-stack.reshape(len(stack), -1, stack.shape[-1]).var(1))
+        weight_samples = np.exp(-entries.var(1))
         weight_samples /= weight_samples.sum(1, keepdims=True)
         uncertainty = z * weight_samples.std(0, ddof=1) / np.sqrt(len(stack))
         if previous is not None and np.all(np.abs(weights - previous) <= uncertainty): break
@@ -111,11 +117,14 @@ def adaptive_bootstrap(estimator: Callable[[np.ndarray], np.ndarray], n: int, se
 
 
 def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: int, k: int = 5,
-                         initial: int = 50, increment: int = 25, maximum: int = 500,
-                         confidence: float = 0.95,temperature:float=0.10) -> tuple[torch.Tensor, dict]:
+                         initial: int = 1000, increment: int = 1000, maximum: int = 1000,
+                         confidence: float = 0.95,
+                         clinical_columns: list[str] | None = None) -> tuple[torch.Tensor, dict]:
     """Training-only multi-view clinical prior projected into visual channel space."""
     z = features.detach().float().cpu().numpy(); clinical = np.asarray(clinical, float)
     n, channels = z.shape; variables = clinical.shape[1]
+    clinical_columns=list(clinical_columns or [f"clinical_{i}" for i in range(variables)])
+    if len(clinical_columns)!=variables:raise ValueError('clinical column count does not match C_clin')
     clinical_mean=np.nanmean(clinical,0);clinical_std=np.nanstd(clinical,0)
     clinical = (clinical - clinical_mean) / (clinical_std + 1e-8)
     clinical = np.nan_to_num(clinical)
@@ -123,19 +132,22 @@ def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: 
     def clinical_estimate(index):
         return association_views(clinical[index],clinical[index],k)
 
-    clinical_result = adaptive_bootstrap(clinical_estimate, n, seed, initial, increment, maximum, confidence)
+    clinical_result = adaptive_bootstrap(clinical_estimate, n, seed, initial, increment, maximum, confidence,off_diagonal=True)
     a_rel = clinical_result.aggregate
 
     def projection_estimate(index):
         return association_views(z[index],clinical[index],k)
 
     projection_result = adaptive_bootstrap(projection_estimate, n, seed + 104729, initial, increment, maximum, confidence)
-    r = projection_result.aggregate/float(temperature)
+    r = projection_result.aggregate
     r = r - r.max(1, keepdims=True); projection = np.exp(r); projection /= projection.sum(1, keepdims=True)
     prior = projection @ a_rel @ projection.T
     metadata = {"training_samples":int(n),"visual_channels":int(channels),"clinical_variables":int(variables),
+                "clinical_columns":clinical_columns,"clinical_matrix_shape":[int(n),int(variables)],
+                "clinical_matrix_sha256":hashlib.sha256(np.ascontiguousarray(clinical,dtype=np.float64).tobytes()).hexdigest(),
                 "clinical_normalization_mean":clinical_mean.tolist(),"clinical_normalization_std":clinical_std.tolist(),
+                "A_rel":a_rel.tolist(),"Pi":projection.tolist(),
                 "clinical_weights": clinical_result.weights.tolist(), "clinical_bootstraps": clinical_result.iterations,
                 "projection_weights": projection_result.weights.tolist(), "projection_bootstraps": projection_result.iterations,
-                "seed":int(seed),"nmi_neighbors":int(k),"assignment_temperature":float(temperature)}
+                "seed":int(seed),"nmi_neighbors":int(k)}
     return torch.from_numpy(prior).float(), metadata

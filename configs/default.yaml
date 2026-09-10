@@ -12,8 +12,6 @@ data:
   num_workers: 4
   strict_audit: true
   allow_incomplete_targets: false
-  # Must be verified from an authoritative construction source before Task 4.
-  task4_delta_direction: followup_minus_baseline
 
 model:
   visual_backbone: resnet50
@@ -38,15 +36,14 @@ model:
     hba1c_reg: 0.30
     short_term: 0.30
     long_term: 0.30
-  structural_temperature: 0.10
   structural_loss_weight: 1.0
   hyper_loss_weight: 5.0e-4
-  relation_bootstrap_initial: 50
-  relation_bootstrap_increment: 25
-  relation_bootstrap_max: 500
+  relation_bootstrap_initial: 1000
+  relation_bootstrap_increment: 1000
+  relation_bootstrap_max: 1000
   relation_bootstrap_confidence: 0.95
   permutation_min: 200
-  permutation_max: 5000
+  permutation_max: 10000
   permutation_confidence: 0.99
   nmi_estimator: knn
   nmi_neighbors: 5
@@ -83,8 +80,8 @@ tasks:
     output_dim: 3
     expected_internal_images: 5425
     expected_internal_patients: 518
-    expected_external_images: 6122
-    expected_external_patients: 678
+    expected_external_images: 3522
+    expected_external_patients: 378
     primary_metric: macro_auc
     secondary_metric: accuracy
     maximize: true
@@ -97,9 +94,9 @@ tasks:
     classes: [HC, NODPN, DPN]
     output_dim: 3
     expected_internal_images: 5894
-    expected_internal_patients: 616
-    expected_external_images: 5265
-    expected_external_patients: 450
+    expected_internal_patients: 450
+    expected_external_images: 3832
+    expected_external_patients: 616
     primary_metric: macro_auc
     secondary_metric: accuracy
     maximize: true
@@ -125,16 +122,16 @@ tasks:
     name: Short-term treatment prognosis
     kind: regression
     dataset_dir: ShortTerm
-    targets: [delta_CFS, delta_TBUT, delta_SIT, delta_OSDI]
+    targets: [CFS_1m, TBUT_1m, SIT_1m, OSDI_1m]
     output_dim: 4
     expected_internal_images: 3518
-    expected_internal_patients: 39
+    expected_internal_patients: 28
     expected_external_images: 1027
-    expected_external_patients: 11
+    expected_external_patients: 22
     primary_metric: normalized_mae
     secondary_metric: normalized_rmse
     maximize: false
-    clinical_exclude: [delta_CFS, delta_TBUT, delta_SIT, delta_OSDI, followup_CFS, followup_TBUT, followup_SIT, followup_OSDI]
+    clinical_exclude: [CFS_1m, TBUT_1m, SIT_1m, OSDI_1m]
   task5:
     name: Long-term postoperative prognosis
     kind: classification

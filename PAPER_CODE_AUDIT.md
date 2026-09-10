@@ -9,14 +9,16 @@ every cross-validation fold.
 
 | Paper equation | Mathematical operation | Implementation | Called in | Test |
 |:--|:--|:--|:--|:--:|
-| Eq. (1) | Per-channel min–max normalization and normalized spatial co-activation, producing `M_vis` | `src/models/causal_ccm.py::StructuralPrior.loss` | Stage 1 prior-alignment batches | PASS |
-| Eq. (2) | Clinical adjacency, channel–clinical assignment `Pi`, and `M_prior = Pi A Pi^T` | `src/models/relations.py::association_views`, `adaptive_bootstrap`, `build_relation_prior` | `train.py::construct_priors` | PASS |
-| Eq. (3) | Remove diagonal, Frobenius-normalize both matrices, stop-gradient prior, mean squared alignment | `src/models/causal_ccm.py::StructuralPrior.loss` | Stage 1 after warm-up | PASS |
-| Eq. (4) | Centered-kernel HSIC statistic and permutation significance | `src/models/screening.py::screen_channels` | Per identity in `train.py::screen_all` | PASS |
-| Eq. (5) | Conditional joint kernel, GCV residualization, KCI statistic and candidate-family permutations | `src/models/screening.py::gcv_regularization`, `screen_channels` | Strictly after HSIC candidates, per identity | PASS |
-| Eq. (6) | `G_t(H([e_t || h_cls])) -> [vec(W); b]` | `src/models/unified_causal_ccm.py::UnifiedCausalCCM.forward` | Every Stage-2 train/inference call | PASS |
-| Eq. (7) | Equal task-balanced auxiliary loss plus structural alignment | `train.py::balanced_epoch` | Stage 1 | PASS |
-| Eq. (8) | Equal task-balanced downstream loss plus dynamic-parameter regularization | `train.py::balanced_epoch` | Stage 2 | PASS |
+| Eq. (1) | Min–max channel normalization and normalized spatial co-activation `M_vis` | `src/models/causal_ccm.py::StructuralPrior.loss` | Stage-1 relation alignment | PASS |
+| Eq. (2) | Pearson, Spearman, dCor and NMI clinical relation views | `src/models/relations.py::association_views` | 1,000 task/fold bootstrap samples in `construct_priors` | PASS |
+| Eq. (3) | `M_prior,t = Pi_t A_rel,t Pi_t^T` | `src/models/relations.py::build_relation_prior` | Once per task/fold after warm-up | PASS |
+| Eq. (4) | Off-diagonal Frobenius normalization and stop-gradient `L_prior,t` | `src/models/causal_ccm.py::StructuralPrior.loss` | Correct task prior on every Stage-1 batch | PASS |
+| Eq. (5) | Centered-kernel HSIC and sequential permutation significance | `src/models/screening.py::screen_channels` | Per task/fold | PASS |
+| Eq. (6) | Joint kernel, GCV residualization and candidate-only KCI | `src/models/screening.py::gcv_regularization`, `screen_channels` | After the corresponding HSIC candidate set | PASS |
+| Eq. (7) | Projected visual queries, ClinicalBERT keys/values, residual attention and LayerNorm | `src/models/unified_causal_ccm.py::SemanticContext.forward` | Stage 2 and inference | PASS |
+| Eq. (8) | `G_t(H([e_t || h_cls])) -> [vec(W); b]` | `src/models/unified_causal_ccm.py::UnifiedCausalCCM.forward` | Stage 2 and inference | PASS |
+| Eq. (9) | `f_s,t^T W_s,t + b_s,t` | `src/models/unified_causal_ccm.py::UnifiedCausalCCM.forward` | Stage 2 and inference | PASS |
+| Eq. (10) | Mean squared Frobenius/Euclidean magnitude of generated `W,b` | `UnifiedCausalCCM.forward`, `train.py::balanced_epoch` | Stage-2 objective | PASS |
 
 ## Component and execution-path audit
 
@@ -27,6 +29,7 @@ every cross-validation fold.
 | Pearson/Spearman/dCor/NMI clinical relations | `relations.py::association_views` | train only | fixed prior | relation tests | PASS |
 | Adaptive bootstrap stability weighting | `relations.py::adaptive_bootstrap` | train only | no | deterministic audit metadata | PASS |
 | Clinical-to-visual projection | `relations.py::build_relation_prior` | train only | fixed | shape/metadata checks | PASS |
+| Task/fold prior isolation | `train.py::construct_priors`, `UnifiedCausalCCM.prior_for` | six independent states per fold | restored buffers | wrong-ID and cross-task routing tests | PASS |
 | Task-specific HSIC | `screening.py::screen_channels` | six independent calls | fixed indices | local result objects | PASS |
 | HSIC candidate → KCI | `screening.py::screen_channels` | candidate family only | fixed indices | finite KCI p-values only for HSIC candidates | PASS |
 | Permutation + BH/FDR | `screening.py::_sequential_many`, `_bh` | per identity | no | audit vectors | PASS |
@@ -80,3 +83,10 @@ The accompanying `relation_prior_audit.json` and
 normalization, kernel/GCV values, permutation counts, bootstrap estimates and
 selected channels. No validation, test or external loader is accepted by the
 statistics path.
+
+Each task additionally saves `relation_priors/<identity>/C_clin_metadata.json`,
+`A_rel.json`, `Pi.pt`, `M_prior.pt`, and `relation_view_weights.json`. The
+metadata records task ID, fold ID, cohort, source-manifest digest, clinical
+columns, normalized clinical-matrix digest, training-patient provenance and
+training-only normalization statistics. Raw clinical rows are not duplicated
+into public artifacts.

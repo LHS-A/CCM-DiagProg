@@ -48,7 +48,7 @@ def _sequential_many(stat,null,minimum,maximum,confidence,boundary):
 
 @torch.no_grad()
 def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alpha,seed,
-                    permutation_min=200,permutation_max=5000,permutation_confidence=.99,
+                    permutation_min=200,permutation_max=10000,permutation_confidence=.99,
                     gcv_min=1e-6,gcv_max=1e1,gcv_candidates=50):
     """Sequential-permutation HSIC then KCI screening with BH and GCV."""
     device=descriptors.device;n,channels,_=descriptors.shape

@@ -40,15 +40,19 @@ class UnifiedCausalCCM(nn.Module):
         self.hyper=nn.Sequential(nn.Linear(800,512),nn.GELU(),nn.Linear(512,256),nn.GELU())
         self.generators=nn.ModuleList(nn.Sequential(nn.Linear(256,256),nn.GELU(),nn.Linear(256,256*out+out)) for out in OUTPUT_DIMS)
         self.auxiliary=nn.ModuleList(nn.Linear(channels,out) for out in OUTPUT_DIMS)
+    @staticmethod
+    def _check_task(task:int)->None:
+        if not isinstance(task,int) or task not in range(len(TASKS)):raise IndexError(f'invalid task identity {task!r}')
     def set_channels(self,task:int,indices:Tensor):
-        if task not in range(len(TASKS)):raise IndexError(f'invalid task identity {task}')
+        self._check_task(task)
         indices=torch.as_tensor(indices,dtype=torch.long,device=self.channel_indices.device).flatten().unique(sorted=True)
         if not len(indices):raise ValueError('task-specific channel subset cannot be empty')
         if int(indices.min())<0 or int(indices.max())>=self.channel_indices.shape[1]:raise ValueError('channel index out of range')
         self.channel_indices[task].fill_(-1);self.channel_indices[task,:len(indices)]=indices;self.channel_counts[task]=len(indices)
         self.context.set_input_dim(task,len(indices),self.channel_indices.device)
-    def selected_channels(self,task:int)->Tensor:return self.channel_indices[task,:int(self.channel_counts[task])]
-    def set_prior(self,task:int,prior:Tensor): self.structural_priors[task].set_prior(prior.to(self.channel_indices.device))
+    def selected_channels(self,task:int)->Tensor:self._check_task(task);return self.channel_indices[task,:int(self.channel_counts[task])]
+    def prior_for(self,task:int)->StructuralPrior:self._check_task(task);return self.structural_priors[task]
+    def set_prior(self,task:int,prior:Tensor): self.prior_for(task).set_prior(prior.to(self.channel_indices.device))
     def set_stage_trainability(self,stage:int)->None:
         if stage not in (1,2):raise ValueError('stage must be 1 or 2')
         groups=(self.visual_encoder,self.auxiliary) if stage==1 else (self.text_encoder,self.text_projection,self.context,self.task_embedding,self.hyper,self.generators)
@@ -63,10 +67,11 @@ class UnifiedCausalCCM(nn.Module):
             raise RuntimeError('legacy shared-width masking checkpoint is incompatible with exact task-specific projections; retrain with the current implementation')
         return super().load_state_dict(state,strict=strict)
     def forward(self,image,ids,attention,task:int,available,stage:int=2):
+        self._check_task(task)
         feature=self.visual_encoder(image)
         if stage==1:
             return {'prediction':self.auxiliary[task](F.adaptive_avg_pool2d(feature,1).flatten(1)),
-                    'prior_loss':self.structural_priors[task].loss(feature),'hyper_loss':feature.new_zeros(())}
+                    'prior_loss':self.prior_for(task).loss(feature),'hyper_loss':feature.new_zeros(())}
         if bool(available.any()):
             text=self.text_projection(self.text_encoder(input_ids=ids,attention_mask=attention).last_hidden_state)
             text=text*available[:,None,None].to(text.dtype);patient=text[:,0]
@@ -75,4 +80,5 @@ class UnifiedCausalCCM(nn.Module):
         aware=self.context(feature,text,attention,available,task,self.selected_channels(task));identity=torch.full((len(image),),task,dtype=torch.long,device=image.device)
         code=self.hyper(torch.cat((self.task_embedding(identity),patient),-1));dynamic=self.generators[task](code);out=OUTPUT_DIMS[task]
         weight=dynamic[:,:256*out].view(-1,256,out);bias=dynamic[:,256*out:];prediction=torch.bmm(aware[:,None],weight).squeeze(1)+bias
-        return {'prediction':prediction,'prior_loss':feature.new_zeros(()),'hyper_loss':weight.square().mean()+bias.square().mean()}
+        hyper_loss=(weight.square().sum((1,2))+bias.square().sum(1)).mean()
+        return {'prediction':prediction,'prior_loss':feature.new_zeros(()),'hyper_loss':hyper_loss}

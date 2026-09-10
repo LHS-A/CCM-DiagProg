@@ -6,8 +6,9 @@
 | Min–max visual dependency modeling | `src/models/causal_ccm.py` | `StructuralPrior.loss` | Yes | Fixed | ✓ |
 | Multi-view clinical relation modeling | `src/models/relations.py` | `association_views` | Yes | Fixed | ✓ |
 | Adaptive bootstrap stability weighting | `src/models/relations.py` | `adaptive_bootstrap` | Yes | Fixed | ✓ |
-| Clinical-to-visual relation projection | `src/models/relations.py` | `build_relation_prior` | Yes | Fixed | ✓ |
-| Clinically induced structural prior | `src/models/relations.py` | `build_relation_prior` | Yes | Fixed | ✓ |
+| Task/fold-specific clinical matrix and relation views | `train.py`, `src/models/relations.py` | `construct_priors`, `association_views` | Independent `C_clin,t` and `A_rel,t` per fold | Fixed state | ✓ |
+| Clinical-to-visual relation projection | `src/models/relations.py` | `build_relation_prior` | Independent `Pi_t` per task/fold | Fixed | ✓ |
+| Clinically induced structural prior | `src/models/relations.py`, `src/models/unified_causal_ccm.py` | `build_relation_prior`, `set_prior`, `prior_for` | Independent `M_prior,t` per task/fold | Restored buffer | ✓ |
 | Off-diagonal prior alignment | `src/models/causal_ccm.py` | `StructuralPrior.loss` | Yes | No | ✓ |
 | HSIC target-relevance screening | `src/models/screening.py` | `screen_channels` | Training patients only | Fixed indices | ✓ |
 | KCI conditional screening and GCV | `src/models/screening.py` | `screen_channels`, `gcv_regularization` | HSIC candidates from training patients only | Fixed indices | ✓ |

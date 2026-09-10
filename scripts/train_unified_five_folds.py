@@ -61,7 +61,7 @@ def main()->int:
     root=Path(__file__).resolve().parents[1]
     for fold in folds:
         manifests=args.work_dir/f"fold_{fold+1}";create_manifests(args.source_manifests,manifests,fold,args.seed)
-        command=[sys.executable,str(root/"train.py"),"--config",str(args.config),"--manifests-dir",str(manifests),"--output",str(args.output/f"fold_{fold+1}"),"--seed",str(args.seed+fold)]
+        command=[sys.executable,str(root/"train.py"),"--config",str(args.config),"--manifests-dir",str(manifests),"--output",str(args.output/f"fold_{fold+1}"),"--seed",str(args.seed+fold),"--fold-id",f"fold_{fold+1}"]
         subprocess.run(command,check=True,cwd=root)
     return 0
 

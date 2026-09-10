@@ -9,7 +9,10 @@ from PIL import Image
 
 from src.models.screening import screen_channels
 from src.models.causal_ccm import StructuralPrior
+from src.models.relations import build_relation_prior
 from src.data.dataset import CCMManifestDataset
+from src.data.manifests import regression_manifest
+from src.config import load_config
 from train import collect_statistics,learning_rate,task_exclusions,validate_patient_partition
 from scripts.train_unified_five_folds import patient_folds
 import src.models.unified_causal_ccm as unified
@@ -89,9 +92,10 @@ def test_target_masking_structured_leakage_and_half_up_dropout(tmp_path):
         def __call__(self,sentence,**_kwargs):
             self.sentences.append(sentence);return {'input_ids':torch.ones(1,4,dtype=torch.long),'attention_mask':torch.ones(1,4,dtype=torch.long)}
     tokenizer=Tokenizer();frame=pd.DataFrame([{'image_path':str(image),'patient_id':'p1','label':0,'clinical_text':'target: 9; age: 40; sex: 1','clinical_target':9.,'clinical_age':40.,'clinical_sex':1.}])
-    task={'kind':'classification'};dataset=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=.5,excluded_clinical_fields={'target'})
+    task={'kind':'classification'};dataset=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=.5,excluded_clinical_fields={'target'},relation_clinical_fields=['clinical_target','clinical_age'])
     sample=dataset[0]
     assert dataset.clinical_structured_columns==('clinical_age','clinical_sex')
+    assert dataset.clinical_relation_columns==('clinical_target','clinical_age')
     assert 'target' not in tokenizer.sentences[-1].casefold()
     assert len([x for x in tokenizer.sentences[-1].split(';') if x.strip()])==1
     assert sample['clinical_structured'].shape==(2,)
@@ -131,9 +135,61 @@ def test_eq1_eq3_visual_relation_and_stop_gradient():
     module.set_prior(prior);loss=module.loss(feature)
     flat=feature.flatten(2);minimum=flat.amin(-1,keepdim=True)
     normalized=(flat-minimum)/(flat.amax(-1,keepdim=True)-minimum+1e-6)
-    normalized=normalized/(normalized.square().sum(-1,keepdim=True).sqrt()+1e-6)
-    relation=torch.einsum('bcp,bdp->cd',normalized,normalized)
+    numerator=torch.einsum('bcp,bdp->bcd',normalized,normalized);energy=normalized.square().sum(-1)
+    relation=(numerator/(energy[:,:,None]*energy[:,None,:]+1e-6).sqrt()).mean(0)
     eye=torch.eye(2);relation=relation*(1-eye);reference=prior*(1-eye)
     expected=(relation/(relation.norm()+1e-6)-reference/(reference.norm()+1e-6)).square().mean()
     assert torch.allclose(loss,expected);loss.backward()
     assert feature.grad is not None and module.prior.grad is None
+
+
+def test_six_relation_priors_are_isolated_and_wrong_ids_fail(monkeypatch):
+    net=model(monkeypatch)
+    assert len(net.structural_priors)==6
+    assert len({module.prior.data_ptr() for module in net.structural_priors})==6
+    with pytest.raises(IndexError):net.prior_for(-1)
+    with pytest.raises(IndexError):net.set_prior(6,torch.eye(2048))
+    class Routed(nn.Module):
+        def __init__(self,value):super().__init__();self.value=value
+        def loss(self,feature):return feature.new_tensor(float(self.value))
+    net.structural_priors=nn.ModuleList(Routed(i) for i in range(6))
+    image=torch.ones(1,3,8,8);ids=torch.ones(1,2,dtype=torch.long);available=torch.zeros(1,dtype=torch.bool)
+    for task in range(6):assert net(image,ids,ids,task,available,stage=1)['prior_loss'].item()==task
+
+
+def test_eq10_hypernetwork_regularization_is_sample_mean_of_norms(monkeypatch):
+    net=model(monkeypatch);net.set_channels(3,torch.arange(7));net.eval()
+    image=torch.ones(2,3,8,8);ids=torch.tensor([[1,2],[2,1]]);mask=torch.ones_like(ids);available=torch.ones(2,dtype=torch.bool)
+    result=net(image,ids,mask,3,available,stage=2)
+    text=net.text_projection(net.text_encoder(input_ids=ids,attention_mask=mask).last_hidden_state);patient=text[:,0]
+    identity=torch.full((2,),3,dtype=torch.long);code=net.hyper(torch.cat((net.task_embedding(identity),patient),-1));dynamic=net.generators[3](code)
+    weight=dynamic[:,:256].view(-1,256,1);bias=dynamic[:,256:]
+    expected=(weight.square().sum((1,2))+bias.square().sum(1)).mean()
+    assert torch.allclose(result['hyper_loss'],expected)
+
+
+def test_task_and_fold_relation_quantities_do_not_share_cache():
+    rng=np.random.default_rng(91);states=[]
+    for task in range(6):
+        clinical=rng.normal(size=(18,3));clinical[:,1]+=clinical[:,0]*(task+1)/7
+        feature=torch.tensor(rng.normal(size=(18,5))+clinical[:,[0]],dtype=torch.float32)
+        prior,audit=build_relation_prior(feature,clinical,seed=100+task,k=2,initial=2,increment=1,maximum=2,clinical_columns=['age','sex','duration'])
+        assert prior.shape==(5,5) and np.asarray(audit['A_rel']).shape==(3,3) and np.asarray(audit['Pi']).shape==(5,3)
+        states.append((audit['clinical_matrix_sha256'],np.asarray(audit['A_rel']),np.asarray(audit['Pi']),prior))
+    assert len({x[0] for x in states})==6
+    assert len({x[3].data_ptr() for x in states})==6
+    clinical=rng.normal(size=(18,3));feature=torch.tensor(rng.normal(size=(18,5)),dtype=torch.float32)
+    _,fold1=build_relation_prior(feature,clinical,seed=1,k=2,initial=2,increment=1,maximum=2)
+    _,fold2=build_relation_prior(feature[:15],clinical[:15],seed=2,k=2,initial=2,increment=1,maximum=2)
+    assert fold1['clinical_matrix_sha256']!=fold2['clinical_matrix_sha256']
+
+
+def test_latest_paper_defaults_and_absolute_one_month_targets(tmp_path):
+    cfg=load_config();assert cfg['model']['relation_bootstrap_initial']==1000==cfg['model']['relation_bootstrap_max']
+    assert cfg['model']['permutation_max']==10000
+    expected=['CFS_1m','TBUT_1m','SIT_1m','OSDI_1m'];assert cfg['tasks']['task4']['targets']==expected
+    source=pd.DataFrame([{'Image_Name':'x.png','Name':'p1','Age':'40','Sex':'Female','OSDI':'20','Pain_Score':'2','BUT':'3','CFS':'4','SIT':'5','OSDI_1m':'10','BUT_1m':'6','CFS_1m':'1','SIT_1m':'8'}])
+    source.to_csv(tmp_path/'Final_Comprehensive_Analysis.csv',index=False)
+    manifest=regression_manifest(tmp_path,{'id':'task4','targets':expected},'unused')
+    assert manifest.loc[0,expected].tolist()==[1.,6.,8.,10.]
+    assert all(bool(manifest.loc[0,f'target_valid_{name}']) for name in expected)

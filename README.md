@@ -10,10 +10,10 @@ Official implementation of the unified Causal-CCM framework for diagnosis, clini
 | 1 | Systemic neuropathy diagnosis | HC, NODPN, DPN |
 | 2 | Ocular-surface metric regression | CFS, TBUT, SIT, OSDI |
 | 3 | Glycemic metric regression | HbA1c |
-| 4 | One-month prognosis | ΔCFS, ΔTBUT, ΔSIT, ΔOSDI |
+| 4 | One-month prognosis | CFS_1m, TBUT_1m, SIT_1m, OSDI_1m |
 | 5 | Six-month prognosis | Non-persistent, Persistent |
 
-All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements adaptive multi-view clinical relation priors, prior-guided visual alignment, sequential-permutation HSIC/KCI channel screening with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
+All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements multi-view clinical relation priors with 1,000 bootstrap resamples, prior-guided visual alignment, sequential-permutation HSIC/KCI channel screening (up to 10,000 permutations) with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
 
 ## Installation
 
@@ -55,6 +55,13 @@ JSON audits for relation-prior construction and channel screening. AdamW uses
 the paper's cosine schedule from `1e-4` to `1e-6`.
 
 Feature screening is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. KCI is run and BH-corrected only inside the corresponding HSIC candidate family. The complete evidence is written to `relation_prior_audit.json`, `channel_screening_audit.json`, and `screening/<identity>/`.
+
+Clinical relation priors are also task- and fold-specific. For every identity,
+the trainer independently constructs `C_clin,t`, multi-view `A_rel,t`, `Pi_t`
+and `M_prior,t` from that fold's training patients. Exact state and provenance
+are stored under `relation_priors/<identity>/` as clinical metadata and hashes,
+normalization statistics, relation-view weights, `A_rel.json`, `Pi.pt`, and
+`M_prior.pt`. No cross-task or cross-fold relation cache is used.
 
 Run all five patient-level folds (test fold, following validation fold, and
 three training folds) with:
