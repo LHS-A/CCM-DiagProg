@@ -22,6 +22,21 @@ every cross-validation fold.
 
 ## Component and execution-path audit
 
+| Paper component | File | Function | Task-specific | Fold-specific | Training | Inference | Test | Status |
+|:--|:--|:--|:--:|:--:|:--:|:--:|:--|:--:|
+| Clinical relation matrix `C_clin,t` | `src/data/dataset.py`, `train.py` | `CCMManifestDataset`, `collect_statistics` | Yes | Yes | training partition only | restored provenance | clinical/nuisance separation | PASS |
+| Multi-view relation `A_rel,t` | `src/models/relations.py` | `association_views`, `adaptive_bootstrap` | Yes | Yes | 1,000 bootstraps | restored artifact | relation numeric tests | PASS |
+| Projection `Pi_t` | `src/models/relations.py` | `build_relation_prior` | Yes | Yes | derived per identity | restored buffer/artifact | shape and isolation tests | PASS |
+| Clinical prior `M_prior,t` | `src/models/relations.py`, `train.py` | `build_relation_prior`, `construct_priors` | Yes | Yes | derived per identity | selected by task ID | Eq. (3), routing tests | PASS |
+| Prior-guided alignment | `src/models/causal_ccm.py`, `src/models/unified_causal_ccm.py` | `StructuralPrior.loss`, `prior_for` | Yes | Yes | Stage 1 | fixed state | Eq. (1)/(4), wrong-ID tests | PASS |
+| HSIC candidate screening | `src/models/screening.py`, `train.py` | `screen_channels`, `screen_all` | Yes | Yes | training partition only | restored indices | candidate-family tests | PASS |
+| KCI conditional screening | `src/models/screening.py`, `train.py` | `gcv_regularization`, `screen_channels` | Yes | Yes | training partition only | restored indices | candidate-only KCI tests | PASS |
+| Retention `rho_t` and set `S_t` | `train.py`, `src/models/unified_causal_ccm.py` | `task_setting`, `set_channels` | Yes | Yes | fixed after Stage 1 | task-routed selection | six-buffer tests | PASS |
+| Semantic contextualization | `src/models/unified_causal_ccm.py` | `SemanticContext.forward` | task-routed | checkpoint/fold state | Stage 2 | Yes | missing-context tests | PASS |
+| Dynamic hypernetwork prediction | `src/models/unified_causal_ccm.py` | `UnifiedCausalCCM.forward` | generator per identity | checkpoint/fold state | Stage 2 | Yes | Eq. (8)-(10) tests | PASS |
+
+The detailed call-path evidence follows.
+
 | Paper component | File / function | Training | Inference | Automated evidence | Status |
 |:--|:--|:--:|:--:|:--|:--:|
 | Shared ResNet-50 visual encoder | `unified_causal_ccm.py::visual_encoder` | Yes | Yes | six-task forward | PASS |
