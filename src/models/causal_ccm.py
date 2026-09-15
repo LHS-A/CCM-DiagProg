@@ -41,11 +41,14 @@ class StructuralPrior(nn.Module):
         normalized = (flat - minimum) / (flat.amax(dim=-1, keepdim=True) - minimum + 1e-6)
         numerator = torch.einsum("bcp,bdp->bcd", normalized, normalized)
         energy = normalized.square().sum(-1)
-        denominator = (energy[:, :, None] * energy[:, None, :] + 1e-6).sqrt()
+        # Eq. (1): ||f_i||_2 ||f_j||_2 + epsilon.
+        denominator = energy[:, :, None].sqrt() * energy[:, None, :].sqrt() + 1e-6
         dependency = (numerator / denominator).mean(0)
         eye = torch.eye(dependency.shape[0], device=dependency.device, dtype=dependency.dtype)
         dependency = dependency * (1 - eye)
         prior = self.prior.to(dependency.dtype) * (1 - eye)
         dependency = dependency / (dependency.norm() + 1e-6)
         prior = prior / (prior.norm() + 1e-6)
-        return (dependency - prior.detach()).square().mean()
+        # Eq. (4) averages only the C(C-1) off-diagonal relations.
+        channels = dependency.shape[0]
+        return (dependency - prior.detach()).square().sum() / max(channels * (channels - 1), 1)

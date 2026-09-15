@@ -29,13 +29,23 @@ def task_exclusions(task,identity):
     """Resolve the paper's target/future/proxy mask for one task identity."""
     configured=task.get('clinical_exclude_by_identity',{})
     return set(configured.get(IDENTITY_NAMES[identity],task.get('clinical_exclude',[])))
+def task_available_fields(task,identity):
+    configured=task.get('clinical_available_by_identity',{})
+    return set(configured.get(IDENTITY_NAMES[identity],task.get('clinical_available_fields',[])))
 
 def relation_fields(frame,task,identity):
-    fields=[x for x in frame.columns if x.startswith('clinical_') and x!='clinical_text']
     if task['kind']=='classification':targets=['label']
-    elif identity==2:targets=['CFS','TBUT','SIT','OSDI']
+    elif identity==2:targets=['TBUT','CFS','SIT','OSDI']
     elif identity==3:targets=['HbA1c']
     else:targets=list(task['targets'])
+    target_keys={x.casefold() for x in targets};allowed={x.casefold() for x in task_available_fields(task,identity)}
+    fields=[]
+    for column in frame.columns:
+        if not column.startswith('clinical_') or column=='clinical_text':continue
+        short=column[len('clinical_'):].casefold()
+        if short in target_keys:continue
+        if allowed and short not in allowed and column.casefold() not in allowed:continue
+        fields.append(column)
     return list(dict.fromkeys(fields+targets))
 
 def validate_patient_partition(frame,path):
@@ -52,7 +62,7 @@ def make_loaders(cfg,task,path,tokenizer,identity):
     for split in ('train','validation','test'):
         subset=frame[frame.split.eq(split)].reset_index(drop=True)
         if split=='train' and subset.empty:raise ValueError(f'{path} has no training partition')
-        dataset=CCMManifestDataset(subset,task,tokenizer,int(cfg['data']['input_resolution']),max_length=int(cfg['model']['max_sequence_length']),clinical_missingness=None if split=='train' else float(cfg['model']['clinical_missingness_eval']),excluded_clinical_fields=task_exclusions(task,identity),partition=split,relation_clinical_fields=relation_fields(frame,task,identity))
+        dataset=CCMManifestDataset(subset,task,tokenizer,int(cfg['data']['input_resolution']),max_length=int(cfg['model']['max_sequence_length']),clinical_missingness=None if split=='train' else float(cfg['model']['clinical_missingness_eval']),excluded_clinical_fields=task_exclusions(task,identity),allowed_clinical_fields=task_available_fields(task,identity),partition=split,relation_clinical_fields=relation_fields(frame,task,identity))
         result[split]=DataLoader(dataset,batch_size=int(cfg['training']['batch_size']),shuffle=split=='train',num_workers=int(cfg['data']['num_workers']),pin_memory=True)
     return result
 def select(tensor,indices): return tensor if indices is None else tensor[:,indices]
@@ -97,31 +107,20 @@ def collect_statistics(model,entry,device):
         relations.append(b['clinical_relation'].cpu())
         patients.extend(batch['patient_id'])
     gap=torch.cat(gap);descriptors=torch.cat(descriptors);targets=torch.cat(targets);target_masks=torch.cat(target_masks);nuisance=torch.cat(nuisance);relations=torch.cat(relations)
-    # Relation estimation is patient-level so repeated images do not multiply a
-    # patient's clinical evidence; image-level samples remain unchanged in SGD.
-    unique={name:i for i,name in enumerate(dict.fromkeys(patients))};group=torch.tensor([unique[x] for x in patients]);count=torch.bincount(group,minlength=len(unique)).float()
-    def mean_by_patient(value):
-        out=torch.zeros((len(unique),)+value.shape[1:],dtype=value.dtype);out.index_add_(0,group,value);return out/count.view((-1,)+(1,)*(value.ndim-1))
-    gap=mean_by_patient(gap);descriptors=mean_by_patient(descriptors)
-    def masked_mean_by_patient(value,valid):
-        safe=torch.where(valid,value,torch.zeros_like(value));total=torch.zeros((len(unique),)+value.shape[1:],dtype=value.dtype);number=torch.zeros_like(total)
-        total.index_add_(0,group,safe);number.index_add_(0,group,valid.to(value.dtype));return total/number.clamp_min(1),number>0
-    if nuisance.shape[1]:
-        nuisance,nuisance_valid=masked_mean_by_patient(nuisance,torch.isfinite(nuisance));nuisance=torch.where(nuisance_valid,nuisance,torch.full_like(nuisance,float('nan')))
-        column_mean=torch.nanmean(nuisance,0);column_mean=torch.nan_to_num(column_mean);nuisance=torch.where(torch.isfinite(nuisance),nuisance,column_mean)
-    else:nuisance=mean_by_patient(nuisance)
-    relations,relation_valid=masked_mean_by_patient(relations,torch.isfinite(relations));relations=torch.where(relation_valid,relations,torch.full_like(relations,float('nan')))
-    relation_mean=torch.nanmean(relations,0);relation_mean=torch.nan_to_num(relation_mean);relations=torch.where(torch.isfinite(relations),relations,relation_mean)
-    patient_targets=[]
-    for group_id in range(len(unique)):
-        values=targets[group.eq(group_id)]
-        if entry['task']['kind']=='classification' and not bool((values==values[0]).all()):raise ValueError(f'inconsistent labels for patient {list(unique)[group_id]}')
-        patient_targets.append(values.float().mean(0))
+    # Patient identity defines disjoint folds; Eq. 2.1.3 statistics themselves
+    # operate on every training image sample s, as specified by the paper.
     if entry['task']['kind']=='classification':
-        targets=torch.stack(patient_targets).round().long();valid_patients=torch.ones(len(targets),dtype=torch.bool)
-    else:
-        targets,target_valid=masked_mean_by_patient(targets.float(),target_masks.bool());valid_patients=target_valid.reshape(len(targets),-1).all(1)
-    names=list(unique);keep=torch.where(valid_patients)[0];names=[names[i] for i in keep.tolist()]
+        seen={}
+        for patient,value in zip(patients,targets.tolist()):
+            value=int(value)
+            if patient in seen and seen[patient]!=value:raise ValueError(f'inconsistent labels for patient {patient}')
+            seen[patient]=value
+        valid_samples=torch.ones(len(targets),dtype=torch.bool)
+    else:valid_samples=target_masks.reshape(len(targets),-1).all(1)
+    if nuisance.shape[1]:
+        column_mean=torch.nanmean(nuisance,0);column_mean=torch.nan_to_num(column_mean);nuisance=torch.where(torch.isfinite(nuisance),nuisance,column_mean)
+        nuisance=nuisance[:,nuisance.std(0)>0]
+    keep=torch.where(valid_samples)[0];names=[patients[i] for i in keep.tolist()]
     return gap[keep],descriptors[keep],targets[keep],nuisance[keep],relations[keep],names
 
 def construct_priors(model,entries,device,cfg,seed,out,fold_id):
@@ -130,14 +129,20 @@ def construct_priors(model,entries,device,cfg,seed,out,fold_id):
         identity=entry['identity'];gap,descriptors,target,nuisance,relation,patients=collect_statistics(model,entry,device)
         if nuisance.shape[1] == 0 or bool((nuisance.std(0) == 0).all()):
             raise RuntimeError(f'{IDENTITY_NAMES[identity]} has no varying training-only non-target clinical variables')
-        clinical_columns=list(entry['loaders']['train'].dataset.clinical_relation_columns)
+        clinical_columns=list(entry['loaders']['train'].dataset.clinical_relation_columns);clinical_types=list(entry['loaders']['train'].dataset.clinical_relation_types)
+        keep=[]
+        for column in range(relation.shape[1]):
+            observed=relation[:,column][torch.isfinite(relation[:,column])]
+            keep.append(len(observed)>1 and int(observed.unique().numel())>1)
+        keep_tensor=torch.tensor(keep,dtype=torch.bool);relation=relation[:,keep_tensor]
+        clinical_columns=[x for x,chosen in zip(clinical_columns,keep) if chosen];clinical_types=[x for x,chosen in zip(clinical_types,keep) if chosen]
         if relation.shape[1]<2:raise RuntimeError(f'{IDENTITY_NAMES[identity]} requires at least two task-specific clinical supervision variables for A_rel')
-        prior,relation_audit=build_relation_prior(gap,relation.numpy(),seed=seed+identity*1009,k=int(cfg['model']['nmi_neighbors']),initial=int(cfg['model']['relation_bootstrap_initial']),increment=int(cfg['model']['relation_bootstrap_increment']),maximum=int(cfg['model']['relation_bootstrap_max']),confidence=float(cfg['model']['relation_bootstrap_confidence']),clinical_columns=clinical_columns)
+        prior,relation_audit=build_relation_prior(gap,relation.numpy(),seed=seed+identity*1009,k=int(cfg['model']['nmi_neighbors']),resamples=int(cfg['model']['relation_bootstrap_resamples']),clinical_columns=clinical_columns,clinical_types=clinical_types)
         model.set_prior(identity,prior)
-        manifest=Path(entry['manifest_path']);provenance={'task_id':identity,'task':IDENTITY_NAMES[identity],'fold_id':str(fold_id),'cohort':entry['task']['dataset_dir'],'partition':'train','source_manifest':str(manifest),'source_manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),'patient_ids':patients}
+        manifest=Path(entry['manifest_path']);provenance={'task_id':identity,'task':IDENTITY_NAMES[identity],'fold_id':str(fold_id),'cohort':entry['task']['dataset_dir'],'partition':'train','source_manifest':str(manifest),'source_manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),'sample_patient_ids':patients,'patient_ids':list(dict.fromkeys(patients))}
         state={**provenance,**relation_audit};audit[str(identity)]=state
         task_dir=out/'relation_priors'/IDENTITY_NAMES[identity];task_dir.mkdir(parents=True,exist_ok=True)
-        (task_dir/'C_clin_metadata.json').write_text(json.dumps({k:state[k] for k in ('task_id','task','fold_id','cohort','partition','source_manifest','source_manifest_sha256','patient_ids','clinical_columns','clinical_matrix_shape','clinical_matrix_sha256','clinical_normalization_mean','clinical_normalization_std')},indent=2)+'\n')
+        (task_dir/'C_clin_metadata.json').write_text(json.dumps({k:state[k] for k in ('task_id','task','fold_id','cohort','partition','source_manifest','source_manifest_sha256','sample_patient_ids','patient_ids','clinical_columns','clinical_types','clinical_matrix_shape','clinical_matrix_sha256','clinical_normalization_mean','clinical_normalization_std')},indent=2)+'\n')
         (task_dir/'A_rel.json').write_text(json.dumps(relation_audit['A_rel'])+'\n')
         torch.save(torch.as_tensor(relation_audit['Pi'],dtype=torch.float32),task_dir/'Pi.pt')
         torch.save(prior.cpu(),task_dir/'M_prior.pt')
@@ -153,7 +158,7 @@ def screen_all(model,entries,device,cfg,seed,out):
             chosen=torch.randperm(full_n,generator=generator)[:maximum]
             descriptors,target,nuisance=descriptors[chosen],target[chosen],nuisance[chosen];patients=[patients[i] for i in chosen.tolist()]
         rho=float(task_setting(cfg['model']['retained_channel_ratio'],identity))
-        selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_min=int(cfg['model']['permutation_min']),permutation_max=int(cfg['model']['permutation_max']),permutation_confidence=float(cfg['model']['permutation_confidence']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
+        selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_resamples=int(cfg['model']['screening_permutation_resamples']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
         model.set_channels(identity,selected);audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','target_representation_shape':list(target.shape),'nuisance_shape':list(nuisance.shape),'rho_t':rho,'selected_channels':selected.cpu().tolist(),'selected_feature_dim':len(selected),'available_patients':full_n,'screening_patients':len(descriptors),'patient_ids':patients,'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement','screening':details}
         task_dir=out/'screening'/IDENTITY_NAMES[identity];task_dir.mkdir(parents=True,exist_ok=True)
         files={'hsic_statistics':details['hsic_statistics'],'hsic_pvalues':details['hsic_p'],'hsic_rejected':details['hsic_rejected'],'kci_statistics':details['kci_statistics'],'kci_pvalues':details['kci_p'],'kci_rejected':details['kci_rejected'],'retention_ratio':rho,'selected_channels':selected.cpu().tolist()}
@@ -166,38 +171,38 @@ def learning_rate(cfg,epoch):
     return minimum+(base-minimum)*.5*(1+math.cos(math.pi*min(epoch,maximum)/maximum))
 def set_learning_rate(optimizer,value):
     for group in optimizer.param_groups:group['lr']=value
+def optimize_phase(model,entries,optimizer,device,stage,cfg,history,epoch,stop_epoch,name,out,fold_id):
+    """Optimize one paper stage to a validation plateau and restore its best state."""
+    best=float('inf');stale=0;patience=int(cfg['training']['early_stopping']['patience']);delta=float(cfg['training']['early_stopping']['min_delta'])
+    best_path=out/f'best_{name}.pt'
+    while epoch<stop_epoch:
+        epoch+=1;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr)
+        tr=balanced_epoch(model,entries,optimizer,device,stage,cfg);va=balanced_epoch(model,entries,None,device,stage,cfg)
+        history.append({'epoch':epoch,'stage':name,'learning_rate':lr,'train_loss':tr,'validation_loss':va});print(history[-1],flush=True)
+        if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,out/f'epoch_{epoch:04d}.pt',epoch,fold_id)
+        if va<best-delta:best=va;stale=0;save(model,cfg,history,best_path,epoch,fold_id)
+        else:stale+=1
+        if stale>=patience:break
+    if not best_path.exists():raise RuntimeError(f'{name} produced no finite validation checkpoint')
+    payload=torch.load(best_path,map_location=device);model.load_state_dict(payload['model_state'])
+    return epoch
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,default=Path('configs/default.yaml'));parser.add_argument('--manifests-dir',type=Path,required=True);parser.add_argument('--output',type=Path,default=Path('checkpoints/unified_six_task'));parser.add_argument('--seed',type=int,default=3407);parser.add_argument('--fold-id',default='single_fold');parser.add_argument('--resume-stage1',type=Path);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,default=Path('configs/default.yaml'));parser.add_argument('--manifests-dir',type=Path,required=True);parser.add_argument('--output',type=Path,default=Path('checkpoints/unified_six_task'));parser.add_argument('--seed',type=int,default=3407);parser.add_argument('--fold-id',default='single_fold');args=parser.parse_args()
     cfg=load_config(args.config);set_seed(args.seed,True)
     if not torch.cuda.is_available():raise RuntimeError('CUDA is required for training')
     device=torch.device('cuda');tokenizer=AutoTokenizer.from_pretrained(resolve_cached_model(cfg['model']['clinical_encoder']));model=UnifiedCausalCCM(cfg['model']).to(device);args.output.mkdir(parents=True,exist_ok=True)
     entries=[]
     for task_id,identity,indices in SPECS:
         task=get_task(cfg,task_id);manifest=args.manifests_dir/f'{task_id}.csv';entries.append({'task':task,'identity':identity,'indices':indices,'manifest_path':manifest,'loaders':make_loaders(cfg,task,manifest,tokenizer,identity)})
-    history=[];epoch=0;model.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
-    warmup=int(cfg['training']['visual_warmup_epochs']);stage1=int(cfg['training']['stage1_epochs'])
-    if args.resume_stage1:
-        checkpoint=torch.load(args.resume_stage1,map_location=device);model.load_state_dict(checkpoint['model_state']);model.set_stage_trainability(1);history=checkpoint.get('history',[]);epoch=int(checkpoint.get('global_epoch',0))
-    for target_epoch in range(epoch+1,warmup+1):
-        epoch=target_epoch;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'warmup','learning_rate':lr,'train_loss':tr,'validation_loss':va})
-        print(history[-1],flush=True)
-        if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch,args.fold_id)
-    if epoch==warmup:save(model,cfg,history,args.output/'stage1_warmup_complete.pt',epoch,args.fold_id)
-    if not all(bool(prior.prior_ready) for prior in model.structural_priors):
-        if epoch<warmup:raise RuntimeError('structural prior construction requires completed visual warm-up')
-        construct_priors(model,entries,device,cfg,args.seed,args.output,args.fold_id)
-    for target_epoch in range(max(epoch+1,warmup+1),stage1+1):
-        epoch=target_epoch;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,1,cfg);va=balanced_epoch(model,entries,None,device,1,cfg);history.append({'epoch':epoch,'stage':'prior_alignment','learning_rate':lr,'train_loss':tr,'validation_loss':va})
-        print(history[-1],flush=True)
-        if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch,args.fold_id)
+    history=[];epoch=0;maximum=int(cfg['training']['max_epochs']);model.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
+    epoch=optimize_phase(model,entries,optimizer,device,1,cfg,history,epoch,min(maximum,int(cfg['training']['warmup_max_epochs'])),'warmup',args.output,args.fold_id)
+    construct_priors(model,entries,device,cfg,args.seed,args.output,args.fold_id)
+    relation_stop=min(maximum,epoch+int(cfg['training']['relation_alignment_max_epochs']))
+    epoch=optimize_phase(model,entries,optimizer,device,1,cfg,history,epoch,relation_stop,'prior_alignment',args.output,args.fold_id)
     screen_all(model,entries,device,cfg,args.seed,args.output)
     model.set_stage_trainability(2)
-    optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']));best=float('inf');stale=0
-    for local in range(1,int(cfg['training']['max_epochs'])-stage1+1):
-        epoch+=1;lr=learning_rate(cfg,epoch-1);set_learning_rate(optimizer,lr);tr=balanced_epoch(model,entries,optimizer,device,2,cfg);va=balanced_epoch(model,entries,None,device,2,cfg);history.append({'epoch':epoch,'stage':'semantic_hypernetwork','learning_rate':lr,'train_loss':tr,'validation_loss':va});print(history[-1],flush=True)
-        if epoch%int(cfg['training']['checkpoint_interval_epochs'])==0:save(model,cfg,history,args.output/f'epoch_{epoch:04d}.pt',epoch,args.fold_id)
-        if va<best-float(cfg['training']['early_stopping']['min_delta']):best=va;stale=0;save(model,cfg,history,args.output/'best_model.pt',epoch,args.fold_id)
-        else:stale+=1
-        if local>=int(cfg['training']['early_stopping']['min_epochs']) and stale>=int(cfg['training']['early_stopping']['patience']):break
+    optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
+    if epoch>=maximum:raise RuntimeError('Stage 1 consumed the complete 500-epoch budget before Stage 2')
+    epoch=optimize_phase(model,entries,optimizer,device,2,cfg,history,epoch,maximum,'model',args.output,args.fold_id)
     (args.output/'history.json').write_text(json.dumps(history,indent=2)+'\n')
 if __name__=='__main__':main()

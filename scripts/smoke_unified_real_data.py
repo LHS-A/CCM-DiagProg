@@ -19,6 +19,8 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--manifest',type=Path,default=Path('artifacts/one_fold_splits/task3.csv'));parser.add_argument('--device',default='cuda');args=parser.parse_args()
     if args.device.startswith('cuda') and not torch.cuda.is_available():raise RuntimeError('CUDA requested but unavailable')
     device=torch.device(args.device);cfg=load_config();task=get_task(cfg,'task3');frame=pd.read_csv(args.manifest)
+    manifest_root=args.manifest.resolve().parents[2] if args.manifest.parent.name=='one_fold_splits' else ROOT
+    frame['image_path']=frame.image_path.map(lambda x:str((manifest_root/str(x)).resolve()) if not Path(str(x)).is_absolute() else str(x))
     frame=frame.loc[frame.split.eq('train')].groupby('patient_id',as_index=False).head(1).head(8).copy();frame['split']='train'
     if frame.patient_id.nunique()<6:raise RuntimeError('at least six real training patients are required')
     tokenizer=AutoTokenizer.from_pretrained(resolve_cached_model(cfg['model']['clinical_encoder']))
@@ -27,13 +29,13 @@ def main():
     model=UnifiedCausalCCM({**cfg['model'],'pretrained_visual':False}).to(device);model.set_stage_trainability(1);batch=to_device(next(iter(loader)),device)
     out=model(batch['image'],batch['input_ids'],batch['attention_mask'],2,batch['clinical_available'],1);loss=prediction_loss(out['prediction'],batch['target'][:,1:],batch['target_mask'][:,1:],'regression');loss.backward()
     gap,descriptors,target,nuisance,_,_=collect_statistics(model,entry,device)
-    smoke_cfg=copy.deepcopy(cfg);smoke_cfg['model'].update({'nmi_neighbors':2,'relation_bootstrap_initial':2,'relation_bootstrap_increment':1,'relation_bootstrap_max':2})
+    smoke_cfg=copy.deepcopy(cfg);smoke_cfg['model'].update({'nmi_neighbors':2,'relation_bootstrap_resamples':2})
     with tempfile.TemporaryDirectory() as prior_directory:
         construct_priors(model,[entry],device,smoke_cfg,7,Path(prior_directory),'smoke_fold')
         required=Path(prior_directory)/'relation_priors'/'ocular_reg'
         assert all((required/name).is_file() for name in ('C_clin_metadata.json','A_rel.json','Pi.pt','M_prior.pt','relation_view_weights.json'))
     model.zero_grad(set_to_none=True);out=model(batch['image'],batch['input_ids'],batch['attention_mask'],2,batch['clinical_available'],1);(out['prior_loss']+prediction_loss(out['prediction'],batch['target'][:,1:],batch['target_mask'][:,1:],'regression')).backward()
-    selected,audit=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),False,.01,1.0,11,permutation_min=5,permutation_max=5,permutation_confidence=.90,gcv_candidates=3);model.set_channels(2,selected);model.set_stage_trainability(2)
+    selected,audit=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),False,.01,1.0,11,permutation_resamples=5,gcv_candidates=3);model.set_channels(2,selected);model.set_stage_trainability(2)
     model.zero_grad(set_to_none=True);out=model(batch['image'],batch['input_ids'],batch['attention_mask'],2,batch['clinical_available'],2);(prediction_loss(out['prediction'],batch['target'][:,1:],batch['target_mask'][:,1:],'regression')+float(cfg['model']['hyper_loss_weight'])*out['hyper_loss']).backward()
     with tempfile.TemporaryDirectory() as directory:
         path=Path(directory)/'smoke.pt';torch.save({'model_state':model.state_dict(),'config':cfg},path);clone=UnifiedCausalCCM({**cfg['model'],'pretrained_visual':False}).to(device);clone.load_state_dict(torch.load(path,map_location=device)['model_state']);clone.eval()

@@ -7,15 +7,16 @@ import torch
 from torch import nn
 from PIL import Image
 
-from src.models.screening import screen_channels
+from src.models.screening import screen_channels,top_rho_retention
 from src.models.causal_ccm import StructuralPrior
-from src.models.relations import build_relation_prior
+from src.models.relations import association_views,build_relation_prior
 from src.data.dataset import CCMManifestDataset
 from src.data.manifests import regression_manifest
 from src.config import load_config
-from train import collect_statistics,learning_rate,task_exclusions,validate_patient_partition
+from train import balanced_epoch,collect_statistics,learning_rate,task_exclusions,validate_patient_partition
 from scripts.train_unified_five_folds import patient_folds
 import src.models.unified_causal_ccm as unified
+from infer import classification_metric_rows
 
 
 class DummyVisual(nn.Module):
@@ -31,7 +32,7 @@ class DummyText(nn.Module):
 def model(monkeypatch):
     monkeypatch.setattr(unified,'ResNet50Features',DummyVisual)
     monkeypatch.setattr(unified.AutoModel,'from_pretrained',lambda *_args,**_kwargs:DummyText())
-    return unified.UnifiedCausalCCM({'pretrained_visual':False,'clinical_encoder':'unused','patient_semantic_dim':768,'attention_dim':256,'task_embedding_dim':32})
+    return unified.UnifiedCausalCCM({'pretrained_visual':False,'clinical_encoder':'unused','patient_semantic_dim':768,'attention_dim':256,'attention_heads':8,'task_embedding_dim':32,'hyper_input_dim':800,'hyper_trunk_dims':[512,256],'hyper_hidden_dim':256,'generator_hidden_dim':256})
 
 
 def test_six_task_subsets_are_independent_and_used(monkeypatch):
@@ -75,12 +76,13 @@ def test_hsic_kci_top_rho_audit_is_complete_and_task_local():
     signal=y[:,None]+.02*torch.tensor(rng.normal(size=(n,c)),dtype=torch.float32);descriptors=torch.stack((signal,signal.square()),-1)
     outputs=[]
     for seed,rho in ((11,.25),(23,.30),(37,.35),(41,.40),(53,.45),(67,.50)):
-        selected,audit=screen_channels(descriptors,y,z,False,rho,1.0,seed,permutation_min=25,permutation_max=50,permutation_confidence=.90,gcv_candidates=5)
-        assert len(selected)<=round(c*rho)
+        selected,audit=screen_channels(descriptors,y,z,False,rho,1.0,seed,permutation_resamples=25,gcv_candidates=5)
+        assert len(selected)==max(1,int(np.floor(c*rho)))
         assert audit['selected_channels']==selected.tolist()
         assert len(audit['hsic_statistics'])==c and len(audit['kci_statistics'])==c
         assert sum(np.isfinite(audit['kci_p']))==audit['kci_candidate_count']==len(audit['hsic_candidates'])
-        assert all(a==b for a,b in zip(audit['significant_intersection'],[x and y for x,y in zip(audit['hsic_rejected'],audit['kci_rejected'])]))
+        assert audit['kci_candidate_count']==c
+        assert audit['significant_intersection']==audit['kci_rejected']
         outputs.append(audit)
     assert len({id(x) for x in outputs})==6 and len({x['retention_ratio'] for x in outputs})==6
 
@@ -91,18 +93,19 @@ def test_target_masking_structured_leakage_and_half_up_dropout(tmp_path):
         def __init__(self):self.sentences=[]
         def __call__(self,sentence,**_kwargs):
             self.sentences.append(sentence);return {'input_ids':torch.ones(1,4,dtype=torch.long),'attention_mask':torch.ones(1,4,dtype=torch.long)}
-    tokenizer=Tokenizer();frame=pd.DataFrame([{'image_path':str(image),'patient_id':'p1','label':0,'clinical_text':'target: 9; age: 40; sex: 1','clinical_target':9.,'clinical_age':40.,'clinical_sex':1.}])
-    task={'kind':'classification'};dataset=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=.5,excluded_clinical_fields={'target'},relation_clinical_fields=['clinical_target','clinical_age'])
+    tokenizer=Tokenizer();frame=pd.DataFrame([{'image_path':str(image),'patient_id':'p1','label':0,'clinical_text':'target: 9; future: 8; proxy: 7; age: 40; sex: 1','clinical_target':9.,'clinical_age':40.,'clinical_sex':1.}])
+    task={'kind':'classification'};dataset=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=.5,excluded_clinical_fields={'target','future','proxy'},allowed_clinical_fields={'target','future','proxy','age','sex'},relation_clinical_fields=['clinical_target','clinical_age'])
     sample=dataset[0]
     assert dataset.clinical_structured_columns==('clinical_age','clinical_sex')
     assert dataset.clinical_relation_columns==('clinical_target','clinical_age')
-    assert 'target' not in tokenizer.sentences[-1].casefold()
-    assert len([x for x in tokenizer.sentences[-1].split(';') if x.strip()])==1
+    assert not any(x in tokenizer.sentences[-1].casefold() for x in ('target','future','proxy'))
+    assert tokenizer.sentences[-1].startswith('A ') and tokenizer.sentences[-1].endswith('.')
     assert sample['clinical_structured'].shape==(2,)
     assert sample['data_partition']=='unspecified'
     complete=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=0.0,excluded_clinical_fields={'target'})[0]
     missing=CCMManifestDataset(frame,task,tokenizer,4,clinical_missingness=1.0,excluded_clinical_fields={'target'})[0]
     assert bool(complete['clinical_available']) and not bool(missing['clinical_available'])
+    assert tokenizer.sentences[-1]==''
 
 
 def test_identity_specific_safe_fields_and_provenance_guards():
@@ -129,16 +132,16 @@ def test_paper_cosine_schedule_and_patient_folds():
     assert len(assignment)==20 and set(assignment.values())==set(range(5))
 
 
-def test_eq1_eq3_visual_relation_and_stop_gradient():
-    feature=torch.tensor([[[[0.,1.],[2.,3.]],[[3.,1.],[2.,0.]]]],requires_grad=True)
-    module=StructuralPrior(2);prior=torch.tensor([[1.,.25],[.25,1.]])
+def test_eq1_eq4_visual_relation_denominator_and_stop_gradient():
+    feature=torch.tensor([[[[0.,1.],[2.,4.]],[[4.,1.],[2.,0.]],[[0.,2.],[1.,1.]]]],requires_grad=True)
+    module=StructuralPrior(3);prior=torch.tensor([[1.,.25,.1],[.25,1.,.8],[.1,.8,1.]])
     module.set_prior(prior);loss=module.loss(feature)
     flat=feature.flatten(2);minimum=flat.amin(-1,keepdim=True)
     normalized=(flat-minimum)/(flat.amax(-1,keepdim=True)-minimum+1e-6)
     numerator=torch.einsum('bcp,bdp->bcd',normalized,normalized);energy=normalized.square().sum(-1)
-    relation=(numerator/(energy[:,:,None]*energy[:,None,:]+1e-6).sqrt()).mean(0)
-    eye=torch.eye(2);relation=relation*(1-eye);reference=prior*(1-eye)
-    expected=(relation/(relation.norm()+1e-6)-reference/(reference.norm()+1e-6)).square().mean()
+    relation=(numerator/(energy[:,:,None].sqrt()*energy[:,None,:].sqrt()+1e-6)).mean(0)
+    eye=torch.eye(3);relation=relation*(1-eye);reference=prior*(1-eye)
+    expected=(relation/(relation.norm()+1e-6)-reference/(reference.norm()+1e-6)).square().sum()/(3*2)
     assert torch.allclose(loss,expected);loss.backward()
     assert feature.grad is not None and module.prior.grad is None
 
@@ -173,25 +176,27 @@ def test_task_and_fold_relation_quantities_do_not_share_cache():
     for task in range(6):
         clinical=rng.normal(size=(18,3));clinical[:,1]+=clinical[:,0]*(task+1)/7
         feature=torch.tensor(rng.normal(size=(18,5))+clinical[:,[0]],dtype=torch.float32)
-        prior,audit=build_relation_prior(feature,clinical,seed=100+task,k=2,initial=2,increment=1,maximum=2,clinical_columns=['age','sex','duration'])
+        prior,audit=build_relation_prior(feature,clinical,seed=100+task,k=2,resamples=2,clinical_columns=['age','sex','duration'])
         assert prior.shape==(5,5) and np.asarray(audit['A_rel']).shape==(3,3) and np.asarray(audit['Pi']).shape==(5,3)
+        assert np.allclose(prior.numpy(),np.asarray(audit['Pi'])@np.asarray(audit['A_rel'])@np.asarray(audit['Pi']).T)
         states.append((audit['clinical_matrix_sha256'],np.asarray(audit['A_rel']),np.asarray(audit['Pi']),prior))
     assert len({x[0] for x in states})==6
     assert len({x[3].data_ptr() for x in states})==6
     clinical=rng.normal(size=(18,3));feature=torch.tensor(rng.normal(size=(18,5)),dtype=torch.float32)
-    _,fold1=build_relation_prior(feature,clinical,seed=1,k=2,initial=2,increment=1,maximum=2)
-    _,fold2=build_relation_prior(feature[:15],clinical[:15],seed=2,k=2,initial=2,increment=1,maximum=2)
+    _,fold1=build_relation_prior(feature,clinical,seed=1,k=2,resamples=2)
+    _,fold2=build_relation_prior(feature[:15],clinical[:15],seed=2,k=2,resamples=2)
     assert fold1['clinical_matrix_sha256']!=fold2['clinical_matrix_sha256']
 
 
 def test_latest_paper_defaults_and_absolute_one_month_targets(tmp_path):
-    cfg=load_config();assert cfg['model']['relation_bootstrap_initial']==1000==cfg['model']['relation_bootstrap_max']
-    assert cfg['model']['permutation_max']==10000
-    expected=['CFS_1m','TBUT_1m','SIT_1m','OSDI_1m'];assert cfg['tasks']['task4']['targets']==expected
+    cfg=load_config();assert cfg['model']['relation_bootstrap_resamples']==1000
+    assert cfg['model']['screening_permutation_resamples']==1000
+    assert cfg['training']['warmup_max_epochs']==100 and cfg['training']['relation_alignment_max_epochs']==100
+    expected=['TBUT_1m','CFS_1m','SIT_1m','OSDI_1m'];assert cfg['tasks']['task4']['targets']==expected
     source=pd.DataFrame([{'Image_Name':'x.png','Name':'p1','Age':'40','Sex':'Female','OSDI':'20','Pain_Score':'2','BUT':'3','CFS':'4','SIT':'5','OSDI_1m':'10','BUT_1m':'6','CFS_1m':'1','SIT_1m':'8'}])
     source.to_csv(tmp_path/'Final_Comprehensive_Analysis.csv',index=False)
     manifest=regression_manifest(tmp_path,{'id':'task4','targets':expected},'unused')
-    assert manifest.loc[0,expected].tolist()==[1.,6.,8.,10.]
+    assert manifest.loc[0,expected].tolist()==[6.,1.,8.,10.]
     assert all(bool(manifest.loc[0,f'target_valid_{name}']) for name in expected)
 
 
@@ -201,3 +206,40 @@ def test_public_model_api_exposes_only_the_unified_method():
     assert public_models.__all__ == ["ResNet50Features", "StructuralPrior", "UnifiedCausalCCM"]
     assert not hasattr(public_models, "CausalCCM")
     assert not hasattr(public_models, "build_model")
+
+
+def test_relation_views_respect_variable_types_and_top_rho_backfill():
+    x=np.array([[0,0.],[1,1.],[0,2.],[1,3.],[0,4.],[1,5.]])
+    views=association_views(x,x,k=2,x_types=['nominal','continuous'],y_types=['nominal','continuous'])
+    assert np.isnan(views[0,1,0]) and np.isnan(views[0,1,1])
+    assert np.isfinite(views[0,1,2:]).all() and np.isfinite(views[1,1]).all()
+    hs=torch.tensor([.1,.9,.8,.7,.2]);ks=torch.tensor([float('-inf'),.5,.4,.3,float('-inf')])
+    candidates=torch.tensor([1,2,3]);significant=torch.tensor([False,True,False,False,False])
+    selected,budget=top_rho_retention(hs,ks,candidates,significant,.6,5)
+    assert budget==3 and selected.tolist()==[1,2,3]
+
+
+def test_six_identity_stage1_and_stage2_training_steps(monkeypatch):
+    net=model(monkeypatch);device=torch.device('cpu')
+    for identity in range(6):net.set_channels(identity,torch.arange(4))
+    base={'image':torch.ones(1,3,8,8),'input_ids':torch.ones(1,3,dtype=torch.long),'attention_mask':torch.ones(1,3,dtype=torch.long),'clinical_available':torch.ones(1,dtype=torch.bool)}
+    entries=[]
+    for identity,out in enumerate(unified.OUTPUT_DIMS):
+        classification=identity in {0,1,5}
+        width=5 if identity in {2,3} else out
+        batch={**base,'target':torch.zeros((1,),dtype=torch.long) if classification else torch.zeros(1,width),'target_mask':torch.ones((1,),dtype=torch.bool) if classification else torch.ones(1,width,dtype=torch.bool)}
+        indices=[1,2,3,4] if identity==2 else ([0] if identity==3 else None)
+        entries.append({'identity':identity,'indices':indices,'task':{'kind':'classification' if classification else 'regression'},'loaders':{'train':[batch],'validation':[batch]}})
+    cfg={'model':{'structural_loss_weight':1.0,'hyper_loss_weight':5e-4}}
+    net.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in net.parameters() if p.requires_grad),lr=1e-4)
+    assert np.isfinite(balanced_epoch(net,entries,optimizer,device,1,cfg))
+    net.set_stage_trainability(2);optimizer=torch.optim.AdamW((p for p in net.parameters() if p.requires_grad),lr=1e-4)
+    assert np.isfinite(balanced_epoch(net,entries,optimizer,device,2,cfg))
+
+
+def test_paper_classwise_accuracy_and_macro_average():
+    y=np.array([0,0,0,1,1,2]);pred=np.array([0,0,1,1,2,2]);prob=np.full((len(y),3),.05);prob[np.arange(len(y)),pred]=.9
+    rows=classification_metric_rows(y,prob,['a','b','c'])
+    expected=np.mean([2/3,1/2,1.0])
+    assert rows[0]['ACC']==pytest.approx(2/3) and rows[-1]['ACC']==pytest.approx(expected)
+    assert rows[-1]['ACC']!=pytest.approx((pred==y).mean())

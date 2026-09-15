@@ -10,13 +10,13 @@ Official implementation of the unified Causal-CCM framework for diagnosis, clini
 | Identity | Task | Output |
 |---:|---|---|
 | 0 | Ocular-surface diagnosis | HC, DED, NCP |
-| 1 | Systemic neuropathy diagnosis | HC, NODPN, DPN |
-| 2 | Ocular-surface metric regression | CFS, TBUT, SIT, OSDI |
+| 1 | Systemic neuropathy diagnosis | HC, DPN−, DPN+ |
+| 2 | Ocular-surface metric regression | TBUT, CFS, SIT, OSDI |
 | 3 | Glycemic metric regression | HbA1c |
-| 4 | One-month prognosis | CFS_1m, TBUT_1m, SIT_1m, OSDI_1m |
-| 5 | Six-month prognosis | Non-persistent, Persistent |
+| 4 | One-month prognosis | TBUT_1m, CFS_1m, SIT_1m, OSDI_1m |
+| 5 | Six-month prognosis | NPD, PDE |
 
-All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements multi-view clinical relation priors with 1,000 bootstrap resamples, prior-guided visual alignment, sequential-permutation HSIC/KCI channel screening (up to 10,000 permutations) with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
+All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements multi-view clinical relation priors with 1,000 bootstrap resamples, prior-guided visual alignment, fixed-count permutation HSIC/KCI channel filtering with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
 
 ## Installation
 
@@ -39,12 +39,14 @@ image_path,patient_id,split,clinical_text
 Task 3 supplies two shared-model identities: ocular-surface regression and HbA1c regression.
 All rows belonging to one patient must occur in exactly one partition. The
 trainer rejects any patient overlap. Non-target structured clinical variables
-used by the relation prior use the `clinical_` prefix. Target, future and proxy
-fields are excluded by the identity-specific rules in `configs/default.yaml`.
+use the `clinical_` prefix and may be declared as `continuous`, `ordinal`,
+`binary`, or `nominal`. Target, future and proxy fields are excluded by the
+identity-specific allow/exclude rules in `configs/default.yaml`. Safe fields
+are rendered through the fixed paper template; missing phrases are omitted.
 
 ## Training
 
-Train the six identities sequentially in one shared model:
+Train all six identities with task-balanced updates in one shared model:
 
 ```bash
 python train.py \
@@ -57,7 +59,7 @@ The trainer saves `best_model.pt`, periodic checkpoints every 10 epochs, and
 JSON audits for relation-prior construction and channel screening. AdamW uses
 the paper's cosine schedule from `1e-4` to `1e-6`.
 
-Feature screening is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. KCI is run and BH-corrected only inside the corresponding HSIC candidate family. The complete evidence is written to `relation_prior_audit.json`, `channel_screening_audit.json`, and `screening/<identity>/`.
+Feature filtering is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. Every HSIC-evaluated channel and score enters the coarse pool; KCI provides the conditional significant set, and HSIC ranking fills any remaining fixed top-rho budget. The complete evidence is written to `relation_prior_audit.json`, `channel_screening_audit.json`, and `screening/<identity>/`.
 
 Clinical relation priors are also task- and fold-specific. For every identity,
 the trainer independently constructs `C_clin,t`, multi-view `A_rel,t`, `Pi_t`
@@ -79,9 +81,9 @@ python scripts/train_unified_five_folds.py \
 Every fold launches a new shared model and independently reconstructs its
 training-only relation priors, kernels, permutation tests and six channel sets.
 
-Resume a completed Stage-1 run with `--resume-stage1 <checkpoint>`. The
-checkpoint stores all six priors and all six independently selected channel
-sets; legacy shared-mask checkpoints are intentionally rejected.
+The warm-up, prior-alignment and semantic-hypernetwork phases restore their
+best validation checkpoint before continuing. The final checkpoint stores all
+six priors and all six independently selected channel sets.
 
 ## Inference
 
@@ -104,6 +106,16 @@ python infer.py ... --text-missingness 1.0
 ```
 
 Identity indices are zero-based and follow the task table above.
+
+Evaluate all held-out folds and the fixed external cohorts with:
+
+```bash
+python scripts/evaluate_unified_five_folds.py \
+  --fold-manifests artifacts/unified_five_folds \
+  --checkpoints checkpoints/unified_five_folds \
+  --external-manifests /path/to/external_manifests \
+  --output results/unified_five_folds
+```
 
 ## Inference complexity
 

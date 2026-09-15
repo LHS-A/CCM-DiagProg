@@ -10,9 +10,10 @@ from src.utils.huggingface import resolve_cached_model
 TASKS=('oc_diag','sys_diag','oc_reg','hba1c','short','long');OUTPUT_DIMS=(3,3,4,1,4,1)
 
 class SemanticContext(nn.Module):
-    def __init__(self,channels:int,attention_dim:int=256,heads:int=8):
+    def __init__(self,channels:int,text_dim:int,attention_dim:int=256,heads:int=8):
         super().__init__();self.visual=nn.ModuleList(nn.Linear(channels,attention_dim) for _ in TASKS)
-        self.attention=nn.MultiheadAttention(attention_dim,heads,kdim=768,vdim=768,batch_first=True)
+        if attention_dim%heads:raise ValueError('attention dimension must be divisible by number of heads')
+        self.attention=nn.MultiheadAttention(attention_dim,heads,kdim=text_dim,vdim=text_dim,batch_first=True)
         self.norm=nn.ModuleList(nn.LayerNorm(attention_dim) for _ in TASKS)
     def set_input_dim(self,task:int,input_dim:int,device:torch.device):
         current=self.visual[task]
@@ -28,17 +29,28 @@ class SemanticContext(nn.Module):
 
 class UnifiedCausalCCM(nn.Module):
     def __init__(self,cfg:dict[str,Any]):
-        super().__init__();self.visual_encoder=ResNet50Features(bool(cfg['pretrained_visual']));channels=self.visual_encoder.out_channels
-        self.text_encoder=AutoModel.from_pretrained(resolve_cached_model(cfg['clinical_encoder']))
+        super().__init__()
+        if cfg.get('visual_backbone','resnet50')!='resnet50':raise ValueError('the paper specifies a ResNet-50 visual encoder')
+        if int(cfg.get('task_count',6))!=len(TASKS):raise ValueError('the unified paper model has exactly six task identities')
+        self.visual_encoder=ResNet50Features(bool(cfg['pretrained_visual']));channels=self.visual_encoder.out_channels
+        # The method uses token states and the first token directly; the BERT
+        # pooler is neither called nor part of the paper inference graph.
+        self.text_encoder=AutoModel.from_pretrained(resolve_cached_model(cfg['clinical_encoder']),add_pooling_layer=False)
         text_hidden=int(self.text_encoder.config.hidden_size)
         semantic_dim=int(cfg.get('patient_semantic_dim',768))
         self.text_projection=nn.Identity() if text_hidden==semantic_dim else nn.Linear(text_hidden,semantic_dim)
         self.structural_priors=nn.ModuleList(StructuralPrior(channels) for _ in TASKS)
         self.register_buffer('channel_indices',torch.arange(channels).repeat(len(TASKS),1),persistent=True)
         self.register_buffer('channel_counts',torch.full((len(TASKS),),channels,dtype=torch.long),persistent=True)
-        self.context=SemanticContext(channels,int(cfg['attention_dim']),8);self.task_embedding=nn.Embedding(6,int(cfg['task_embedding_dim']))
-        self.hyper=nn.Sequential(nn.Linear(800,512),nn.GELU(),nn.Linear(512,256),nn.GELU())
-        self.generators=nn.ModuleList(nn.Sequential(nn.Linear(256,256),nn.GELU(),nn.Linear(256,256*out+out)) for out in OUTPUT_DIMS)
+        attention_dim=int(cfg['attention_dim']);task_dim=int(cfg['task_embedding_dim']);heads=int(cfg.get('attention_heads',8))
+        trunk=[int(x) for x in cfg['hyper_trunk_dims']];hidden=int(cfg['hyper_hidden_dim']);generator_hidden=int(cfg['generator_hidden_dim'])
+        if int(cfg['hyper_input_dim'])!=semantic_dim+task_dim:raise ValueError('hyper_input_dim must equal patient_semantic_dim + task_embedding_dim')
+        if trunk[-1]!=hidden:raise ValueError('last hypernetwork trunk width must equal hyper_hidden_dim')
+        self.context=SemanticContext(channels,semantic_dim,attention_dim,heads);self.task_embedding=nn.Embedding(len(TASKS),task_dim)
+        layers=[];width=int(cfg['hyper_input_dim'])
+        for next_width in trunk:layers.extend((nn.Linear(width,next_width),nn.GELU()));width=next_width
+        self.hyper=nn.Sequential(*layers)
+        self.generators=nn.ModuleList(nn.Sequential(nn.Linear(hidden,generator_hidden),nn.GELU(),nn.Linear(generator_hidden,attention_dim*out+out)) for out in OUTPUT_DIMS)
         self.auxiliary=nn.ModuleList(nn.Linear(channels,out) for out in OUTPUT_DIMS)
     @staticmethod
     def _check_task(task:int)->None:
@@ -76,9 +88,9 @@ class UnifiedCausalCCM(nn.Module):
             text=self.text_projection(self.text_encoder(input_ids=ids,attention_mask=attention).last_hidden_state)
             text=text*available[:,None,None].to(text.dtype);patient=text[:,0]
         else:
-            text=None;patient=feature.new_zeros(len(image),768)
+            text=None;patient=feature.new_zeros(len(image),self.text_projection.out_features if isinstance(self.text_projection,nn.Linear) else int(self.text_encoder.config.hidden_size))
         aware=self.context(feature,text,attention,available,task,self.selected_channels(task));identity=torch.full((len(image),),task,dtype=torch.long,device=image.device)
         code=self.hyper(torch.cat((self.task_embedding(identity),patient),-1));dynamic=self.generators[task](code);out=OUTPUT_DIMS[task]
-        weight=dynamic[:,:256*out].view(-1,256,out);bias=dynamic[:,256*out:];prediction=torch.bmm(aware[:,None],weight).squeeze(1)+bias
+        feature_dim=aware.shape[1];weight=dynamic[:,:feature_dim*out].view(-1,feature_dim,out);bias=dynamic[:,feature_dim*out:];prediction=torch.bmm(aware[:,None],weight).squeeze(1)+bias
         hyper_loss=(weight.square().sum((1,2))+bias.square().sum(1)).mean()
         return {'prediction':prediction,'prior_loss':feature.new_zeros(()),'hyper_loss':hyper_loss}

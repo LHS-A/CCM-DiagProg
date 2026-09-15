@@ -94,10 +94,9 @@ def regression_manifest(dataset_dir: Path, task: dict[str, Any], delta_direction
     result["image_path"] = result["image_name"].map(lambda x: str((dataset_dir / "image" / x).resolve()))
     result["patient_id"] = frame["Name"].astype(str).str.strip()
     result["patient_id_source"] = "metadata:Name"
-    target_source_columns = {"OSDI"} if task["id"] == "task3" and "OSDI" in task["targets"] else set()
-    for column in ["Age", "DM_Duration_Years", "HTN_Duration_Years", "OSDI", "Pain_Score", "BUT", "CFS", "SIT"]:
-        if column in frame and column not in target_source_columns:
-            result[f"clinical_{column}"] = _numeric(frame[column])
+    clinical_sources={"Age":"Age","DM_Duration_Years":"DM_Duration_Years","HTN_Duration_Years":"HTN_Duration_Years","OSDI":"OSDI","Pain_Score":"Pain_Score","TBUT":"BUT","CFS":"CFS","SIT":"SIT","HbA1c":"HbA1c"}
+    for name,column in clinical_sources.items():
+        if column in frame:result[f"clinical_{name}"]=_numeric(frame[column])
     if "Sex" in frame:
         result["clinical_Sex"] = frame["Sex"].astype(str).str.casefold().map({"male": 1.0, "female": 0.0})
     targets = task["targets"]

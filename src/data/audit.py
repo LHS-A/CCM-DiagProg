@@ -25,7 +25,7 @@ def audit_task(config: dict[str, Any], task: dict[str, Any], validate_images: bo
                 "task": task["id"], "severity": "warning", "kind": "filename_patient_proxy",
                 "detail": "Image-only cohort uses conservative filename-derived groups for leakage-aware splitting; these IDs are not model inputs.",
             })
-        if task["kind"] == "classification" and not task.get("image_only", False) and not any(x.startswith("clinical_") and x != "clinical_text" for x in frame.columns):
+        if task["kind"] == "classification" and not any(x.startswith("clinical_") and x != "clinical_text" for x in frame.columns):
             issues.append({
                 "task": task["id"], "severity": "error", "kind": "missing_clinical_prior_metadata",
                 "detail": "No non-target structured clinical fields are available for structural-prior estimation.",

@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from sklearn.metrics import (accuracy_score,cohen_kappa_score,confusion_matrix,f1_score,
+from sklearn.metrics import (cohen_kappa_score,confusion_matrix,f1_score,
                              mean_absolute_error,mean_squared_error,precision_score,r2_score,
                              recall_score,roc_auc_score)
 from scipy.stats import pearsonr,spearmanr
@@ -20,12 +20,30 @@ from src.models import UnifiedCausalCCM
 from src.utils.huggingface import resolve_cached_model
 
 IDENTITY_TASK = {0: "task1", 1: "task2", 2: "task3", 3: "task3", 4: "task4", 5: "task5"}
-IDENTITY_TARGETS = {2: ["CFS", "TBUT", "SIT", "OSDI"], 3: ["HbA1c"]}
+IDENTITY_TARGETS = {2: ["TBUT", "CFS", "SIT", "OSDI"], 3: ["HbA1c"]}
 IDENTITY_NAMES = ("ocular_diag","systemic_diag","ocular_reg","hba1c_reg","short_term","long_term")
 
 def task_exclusions(task,identity):
     configured=task.get("clinical_exclude_by_identity",{})
     return set(configured.get(IDENTITY_NAMES[identity],task.get("clinical_exclude",[])))
+def task_available_fields(task,identity):
+    configured=task.get("clinical_available_by_identity",{})
+    return set(configured.get(IDENTITY_NAMES[identity],task.get("clinical_available_fields",[])))
+
+def classification_metric_rows(y,probabilities,names):
+    y=np.asarray(y,int);pred=probabilities.argmax(1);cm=confusion_matrix(y,pred,labels=range(len(names)));rows=[]
+    for i,name in enumerate(names):
+        tp=cm[i,i];fn=cm[i].sum()-tp;fp=cm[:,i].sum()-tp;tn=cm.sum()-tp-fn-fp
+        rows.append({'class':name,'ACC':tp/max(tp+fn,1),'AUC':roc_auc_score(y==i,probabilities[:,i]),'SEN':tp/max(tp+fn,1),'SPE':tn/max(tn+fp,1),'PRE':precision_score(y,pred,labels=[i],average='macro',zero_division=0),'F1':f1_score(y,pred,labels=[i],average='macro',zero_division=0),'Kappa':cohen_kappa_score(y,pred)})
+    rows.append({'class':'macro/overall','ACC':float(np.mean([x['ACC'] for x in rows])),'AUC':roc_auc_score(y,probabilities,multi_class='ovr',average='macro') if len(names)>2 else roc_auc_score(y,probabilities[:,1]),'SEN':recall_score(y,pred,average='macro'),'SPE':np.mean([x['SPE'] for x in rows]),'PRE':precision_score(y,pred,average='macro',zero_division=0),'F1':f1_score(y,pred,average='macro',zero_division=0),'Kappa':cohen_kappa_score(y,pred)})
+    return rows
+
+def regression_metric_rows(truth,prediction,names):
+    rows=[]
+    for i,name in enumerate(names):
+        valid=np.isfinite(truth[:,i]);a=truth[valid,i];b=prediction[valid,i]
+        rows.append({'target':name,'RMSE':mean_squared_error(a,b)**.5,'MAE':mean_absolute_error(a,b),'Pearson_r':pearsonr(a,b)[0],'Spearman_rho':spearmanr(a,b)[0],'R2':r2_score(a,b)})
+    return rows
 
 
 def main():
@@ -41,6 +59,10 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config); task = get_task(cfg, IDENTITY_TASK[args.identity])
     frame = pd.read_csv(args.manifest).reset_index(drop=True)
+    # Internal fold manifests contain all partitions; evaluation is strictly on
+    # the held-out test rows. External manifests normally omit ``split``.
+    if "split" in frame and frame["split"].eq("test").any():
+        frame=frame.loc[frame["split"].eq("test")].reset_index(drop=True)
     payload = torch.load(args.checkpoint, map_location="cpu")
     saved_cfg=payload.get("config",{});model_cfg=saved_cfg.get("model",cfg["model"])
     tokenizer = AutoTokenizer.from_pretrained(resolve_cached_model(model_cfg["clinical_encoder"]))
@@ -48,7 +70,8 @@ def main():
     dataset = CCMManifestDataset(frame, task, tokenizer, int(data_cfg["input_resolution"]),
                                  max_length=int(model_cfg["max_sequence_length"]),
                                  clinical_missingness=args.text_missingness,
-                                 excluded_clinical_fields=task_exclusions(task,args.identity))
+                                 excluded_clinical_fields=task_exclusions(task,args.identity),
+                                 allowed_clinical_fields=task_available_fields(task,args.identity))
     loader = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False,
                         num_workers=int(cfg["data"]["num_workers"]), pin_memory=True)
     model = UnifiedCausalCCM({**model_cfg, "pretrained_visual": False})
@@ -75,17 +98,11 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True); output.to_csv(args.output, index=False)
     rows=[]
     if task['kind']=='classification':
-        y=frame.label.to_numpy(int);prob=probabilities;pred=prob.argmax(1);cm=confusion_matrix(y,pred,labels=range(len(names)))
-        for i,name in enumerate(names):
-            tp=cm[i,i];fn=cm[i].sum()-tp;fp=cm[:,i].sum()-tp;tn=cm.sum()-tp-fn-fp
-            rows.append({'class':name,'ACC':tp/max(tp+fn,1),'AUC':roc_auc_score(y==i,prob[:,i]),'SEN':tp/max(tp+fn,1),'SPE':tn/max(tn+fp,1),'PRE':precision_score(y,pred,labels=[i],average='macro',zero_division=0),'F1':f1_score(y,pred,labels=[i],average='macro',zero_division=0),'Kappa':cohen_kappa_score(y,pred)})
-        rows.append({'class':'macro/overall','ACC':accuracy_score(y,pred),'AUC':roc_auc_score(y,prob,multi_class='ovr',average='macro') if len(names)>2 else roc_auc_score(y,prob[:,1]),'SEN':recall_score(y,pred,average='macro'),'SPE':np.mean([x['SPE'] for x in rows]),'PRE':precision_score(y,pred,average='macro',zero_division=0),'F1':f1_score(y,pred,average='macro',zero_division=0),'Kappa':cohen_kappa_score(y,pred)})
+        rows=classification_metric_rows(frame.label.to_numpy(int),probabilities,names)
     else:
         target_names=IDENTITY_TARGETS.get(args.identity,task['targets']);indices=[task['targets'].index(x) for x in target_names]
         truth=frame[task['targets']].to_numpy(float)[:,indices]
-        for i,name in enumerate(target_names):
-            valid=np.isfinite(truth[:,i]);a=truth[valid,i];b=prediction[valid,i]
-            rows.append({'target':name,'RMSE':mean_squared_error(a,b)**.5,'MAE':mean_absolute_error(a,b),'Pearson_r':pearsonr(a,b)[0],'Spearman_rho':spearmanr(a,b)[0],'R2':r2_score(a,b)})
+        rows=regression_metric_rows(truth,prediction,target_names)
     if args.metrics:
         args.metrics.parent.mkdir(parents=True,exist_ok=True);pd.DataFrame(rows).to_csv(args.metrics,index=False)
     print(args.output)
