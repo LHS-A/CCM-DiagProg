@@ -28,22 +28,25 @@ def _permutation_many(stat,null,resamples):
     return (1+exceed).float()/(1+resamples),torch.full_like(exceed,resamples)
 
 def top_rho_retention(hsic_scores,kci_scores,hsic_candidates,significant,retention_ratio,total_channels):
-    """Paper top-rho ranking and deterministic HSIC backfill."""
+    """Retain exactly floor(rho*C) channels using the paper's two rankings."""
     budget=max(1,int(np.floor(total_channels*retention_ratio)))
+    if significant.numel()!=total_channels:raise ValueError('significant mask must be defined over all visual channels')
+    if len(hsic_candidates)<budget:
+        raise RuntimeError(f'HSIC coarse candidate set has {len(hsic_candidates)} channels, fewer than fixed top-rho budget {budget}')
     selected=torch.where(significant)[0]
     if len(selected)>=budget:
         selected=selected[torch.topk(kci_scores[selected],budget).indices]
     else:
         hsic_only=hsic_candidates[~significant[hsic_candidates]];needed=budget-len(selected)
-        if len(hsic_only)<needed:raise RuntimeError(f'HSIC candidate pool has {len(hsic_candidates)} channels, fewer than fixed top-rho budget {budget}')
+        if len(hsic_only)<needed:raise RuntimeError('HSIC-only candidates cannot complete the fixed top-rho budget')
         selected=torch.cat((selected,hsic_only[torch.topk(hsic_scores[hsic_only],needed).indices]))
     return selected.sort().values,budget
 
 @torch.no_grad()
-def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alpha,seed,
+def filter_channels(descriptors,target,nuisance,categorical,retention_ratio,alpha,seed,
                     permutation_resamples=1000,
                     gcv_min=1e-6,gcv_max=1e1,gcv_candidates=50):
-    """Sequential-permutation HSIC then KCI screening with BH and GCV."""
+    """Paper coarse HSIC, fine KCI and fixed-budget top-rho filtering."""
     device=descriptors.device;n,channels,_=descriptors.shape
     raw_ky=_target_kernel(target,categorical);ky=_center(raw_ky);raw_kz,nuisance_bandwidth=_rbf_with_bandwidth(nuisance);kz=_center(raw_kz)
     candidates=torch.logspace(np.log10(gcv_min),np.log10(gcv_max),gcv_candidates,device=device); lam=gcv_regularization(kz,candidates)
@@ -57,9 +60,12 @@ def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alph
         pky=torch.stack([ky[p][:,p] for p in permutations]);return torch.einsum('cij,pij->pc',kx,pky)/max((n-1)**2,1)
     hp_t,hn_t=_permutation_many(hs,hnull,permutation_resamples)
     hsic_rejected=_bh(hp_t,alpha)
-    # The final paper explicitly retains every HSIC-evaluated channel and its
-    # score as the coarse pool; HSIC p-values remain diagnostic only.
-    candidates_idx=torch.arange(channels,device=device)
+    # Sec. 2.1.3: only marginally supported channels form S_HSIC. KCI is
+    # evaluated exclusively on this task-specific coarse candidate set.
+    candidates_idx=torch.where(hsic_rejected)[0]
+    budget=max(1,int(np.floor(channels*retention_ratio)))
+    if len(candidates_idx)<budget:
+        raise RuntimeError(f'HSIC coarse candidate set has {len(candidates_idx)} channels, fewer than fixed top-rho budget {budget}')
     candidate_kx=kx.index_select(0,candidates_idx)
     joint=_center_batch(candidate_kx*kz);rx=torch.einsum('ij,cjk,kl->cil',residual,joint,residual);ry=residual@ky@residual;candidate_ks=(rx*ry.T).sum((-2,-1))/n
     def knull(count):
@@ -71,9 +77,9 @@ def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alph
     kn_t=torch.zeros(channels,dtype=torch.long,device=device);kn_t[candidates_idx]=kn_candidate
     ks=torch.full((channels,),float('-inf'),device=device);ks[candidates_idx]=candidate_ks
     kci_rejected=torch.zeros(channels,dtype=torch.bool,device=device);kci_rejected[candidates_idx]=candidate_rejected
-    significant=kci_rejected
-    # Paper top-rho rule: K=max(1,floor(rho*C)). KCI-supported channels rank
-    # first; a short intersection is completed from the HSIC candidate pool.
+    significant=hsic_rejected & kci_rejected
+    # S_sig=S_HSIC intersection S_KCI. If it is short, only S_HSIC\S_sig is
+    # eligible for HSIC-score backfilling; no out-of-pool fallback is allowed.
     indices,budget=top_rho_retention(hs,ks,candidates_idx,significant,retention_ratio,channels)
     ranking=torch.argsort(ks,descending=True)
     details={'lambda_kci':float(lam),'descriptor_bandwidths':bandwidth.cpu().tolist(),'nuisance_bandwidth':float(nuisance_bandwidth),
@@ -83,3 +89,6 @@ def screen_channels(descriptors,target,nuisance,categorical,retention_ratio,alph
              'conditional_ranking':ranking.cpu().tolist(),'hsic_permutations':hn_t.cpu().tolist(),'kci_permutations':kn_t.cpu().tolist(),
              'retention_ratio':float(retention_ratio),'retention_budget':budget,'selected_count':len(indices),'selected_channels':indices.sort().values.cpu().tolist()}
     return indices.sort().values,details
+
+# Public terminology follows the manuscript. A compatibility alias is not
+# retained because old checkpoints/code are explicitly outside this revision.

@@ -16,7 +16,7 @@ Official implementation of the unified Causal-CCM framework for diagnosis, clini
 | 4 | One-month prognosis | TBUT_1m, CFS_1m, SIT_1m, OSDI_1m |
 | 5 | Six-month prognosis | NPD, PDE |
 
-All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements multi-view clinical relation priors with 1,000 bootstrap resamples, prior-guided visual alignment, fixed-count permutation HSIC/KCI channel filtering with GCV, clinical context dropout, and six-task-balanced Stage-II optimization.
+All identities share one ResNet-50 visual encoder, Tiny ClinicalBERT encoder, task embeddings, semantic alignment module, and hypernetwork. Each identity has its own dynamic parameter generator. The default `nlpie/tiny-clinicalbert` representation is projected from 312 to the framework's fixed 768-dimensional patient-semantic space. Training implements multi-view clinical relation priors with 1,000 bootstrap resamples, prior-guided visual alignment, permutation-tested HSIC/KCI feature filtering with GCV, clinical context dropout, and six-setting-balanced Stage-II optimization.
 
 ## Installation
 
@@ -56,10 +56,10 @@ python train.py \
 ```
 
 The trainer saves `best_model.pt`, periodic checkpoints every 10 epochs, and
-JSON audits for relation-prior construction and channel screening. AdamW uses
+JSON audits for relation-prior construction and channel filtering. AdamW uses
 the paper's cosine schedule from `1e-4` to `1e-6`.
 
-Feature filtering is independent for all six identities. `retained_channel_ratio` is configured by identity, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each identity's training patients. Every HSIC-evaluated channel and score enters the coarse pool; KCI provides the conditional significant set, and HSIC ranking fills any remaining fixed top-rho budget. The complete evidence is written to `relation_prior_audit.json`, `channel_screening_audit.json`, and `screening/<identity>/`.
+Feature filtering is independent for all six prediction settings. `retained_channel_ratio` is configured by setting, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each setting's training partition. HSIC-significant channels form the coarse set `S_HSIC`; KCI is evaluated only on that set, and `S_sig = S_HSIC ∩ S_KCI`. If `S_sig` is smaller than `K=max(1,floor(rho*C))`, the remaining positions are filled only from `S_HSIC \ S_sig` in descending HSIC-score order. No channel outside `S_HSIC` is used as a fallback. The complete evidence is written to `relation_prior_audit.json`, `channel_filtering_audit.json`, and `feature_filtering/<identity>/`.
 
 Clinical relation priors are also task- and fold-specific. For every identity,
 the trainer independently constructs `C_clin,t`, multi-view `A_rel,t`, `Pi_t`

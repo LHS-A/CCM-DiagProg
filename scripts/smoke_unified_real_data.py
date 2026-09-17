@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from src.config import get_task,load_config
 from src.data.dataset import CCMManifestDataset
 from src.models import UnifiedCausalCCM
-from src.models.screening import screen_channels
+from src.models.filtering import filter_channels
 from src.utils.huggingface import resolve_cached_model
 from train import collect_statistics,construct_priors,prediction_loss,relation_fields,to_device
 
@@ -35,7 +35,7 @@ def main():
         required=Path(prior_directory)/'relation_priors'/'ocular_reg'
         assert all((required/name).is_file() for name in ('C_clin_metadata.json','A_rel.json','Pi.pt','M_prior.pt','relation_view_weights.json'))
     model.zero_grad(set_to_none=True);out=model(batch['image'],batch['input_ids'],batch['attention_mask'],2,batch['clinical_available'],1);(out['prior_loss']+prediction_loss(out['prediction'],batch['target'][:,1:],batch['target_mask'][:,1:],'regression')).backward()
-    selected,audit=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),False,.01,1.0,11,permutation_resamples=5,gcv_candidates=3);model.set_channels(2,selected);model.set_stage_trainability(2)
+    selected,audit=filter_channels(descriptors.to(device),target.to(device),nuisance.to(device),False,.01,1.0,11,permutation_resamples=5,gcv_candidates=3);model.set_channels(2,selected);model.set_stage_trainability(2)
     model.zero_grad(set_to_none=True);out=model(batch['image'],batch['input_ids'],batch['attention_mask'],2,batch['clinical_available'],2);(prediction_loss(out['prediction'],batch['target'][:,1:],batch['target_mask'][:,1:],'regression')+float(cfg['model']['hyper_loss_weight'])*out['hyper_loss']).backward()
     with tempfile.TemporaryDirectory() as directory:
         path=Path(directory)/'smoke.pt';torch.save({'model_state':model.state_dict(),'config':cfg},path);clone=UnifiedCausalCCM({**cfg['model'],'pretrained_visual':False}).to(device);clone.load_state_dict(torch.load(path,map_location=device)['model_state']);clone.eval()

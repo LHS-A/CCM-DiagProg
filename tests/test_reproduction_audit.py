@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from PIL import Image
 
-from src.models.screening import screen_channels,top_rho_retention
+from src.models.filtering import filter_channels,top_rho_retention
 from src.models.causal_ccm import StructuralPrior
 from src.models.relations import association_views,build_relation_prior
 from src.data.dataset import CCMManifestDataset
@@ -16,6 +16,7 @@ from src.config import load_config
 from train import balanced_epoch,collect_statistics,learning_rate,task_exclusions,validate_patient_partition
 from scripts.train_unified_five_folds import patient_folds
 import src.models.unified_causal_ccm as unified
+import src.models.filtering as filtering
 from infer import classification_metric_rows
 
 
@@ -76,15 +77,33 @@ def test_hsic_kci_top_rho_audit_is_complete_and_task_local():
     signal=y[:,None]+.02*torch.tensor(rng.normal(size=(n,c)),dtype=torch.float32);descriptors=torch.stack((signal,signal.square()),-1)
     outputs=[]
     for seed,rho in ((11,.25),(23,.30),(37,.35),(41,.40),(53,.45),(67,.50)):
-        selected,audit=screen_channels(descriptors,y,z,False,rho,1.0,seed,permutation_resamples=25,gcv_candidates=5)
+        selected,audit=filter_channels(descriptors,y,z,False,rho,1.0,seed,permutation_resamples=25,gcv_candidates=5)
         assert len(selected)==max(1,int(np.floor(c*rho)))
         assert audit['selected_channels']==selected.tolist()
         assert len(audit['hsic_statistics'])==c and len(audit['kci_statistics'])==c
         assert sum(np.isfinite(audit['kci_p']))==audit['kci_candidate_count']==len(audit['hsic_candidates'])
-        assert audit['kci_candidate_count']==c
-        assert audit['significant_intersection']==audit['kci_rejected']
+        assert audit['hsic_candidates']==np.flatnonzero(audit['hsic_rejected']).tolist()
+        assert audit['kci_candidate_count']==len(audit['hsic_candidates'])==c
+        expected=(np.asarray(audit['hsic_rejected']) & np.asarray(audit['kci_rejected'])).tolist()
+        assert audit['significant_intersection']==expected
         outputs.append(audit)
     assert len({id(x) for x in outputs})==6 and len({x['retention_ratio'] for x in outputs})==6
+
+
+def test_kci_is_restricted_to_the_hsic_significant_coarse_set(monkeypatch):
+    calls=[]
+    def decisions(pvalues,_alpha):
+        calls.append(len(pvalues))
+        if len(calls)==1:return torch.tensor([False,True,False,True,False,True,False,True])
+        return torch.tensor([True,False,True,False])
+    monkeypatch.setattr(filtering,'_bh',decisions)
+    generator=torch.Generator().manual_seed(81)
+    descriptors=torch.randn(24,8,2,generator=generator);target=torch.randn(24,generator=generator);nuisance=torch.randn(24,2,generator=generator)
+    selected,audit=filtering.filter_channels(descriptors,target,nuisance,False,.25,.05,91,permutation_resamples=5,gcv_candidates=3)
+    assert calls==[8,4]
+    assert audit['hsic_candidates']==[1,3,5,7] and audit['kci_candidate_count']==4
+    assert np.flatnonzero(audit['significant_intersection']).tolist()==[1,5]
+    assert selected.tolist()==[1,5]
 
 
 def test_target_masking_structured_leakage_and_half_up_dropout(tmp_path):
@@ -160,7 +179,7 @@ def test_six_relation_priors_are_isolated_and_wrong_ids_fail(monkeypatch):
     for task in range(6):assert net(image,ids,ids,task,available,stage=1)['prior_loss'].item()==task
 
 
-def test_eq10_hypernetwork_regularization_is_sample_mean_of_norms(monkeypatch):
+def test_eq9_hypernetwork_regularization_is_sample_mean_of_norms(monkeypatch):
     net=model(monkeypatch);net.set_channels(3,torch.arange(7));net.eval()
     image=torch.ones(2,3,8,8);ids=torch.tensor([[1,2],[2,1]]);mask=torch.ones_like(ids);available=torch.ones(2,dtype=torch.bool)
     result=net(image,ids,mask,3,available,stage=2)
@@ -190,7 +209,7 @@ def test_task_and_fold_relation_quantities_do_not_share_cache():
 
 def test_latest_paper_defaults_and_absolute_one_month_targets(tmp_path):
     cfg=load_config();assert cfg['model']['relation_bootstrap_resamples']==1000
-    assert cfg['model']['screening_permutation_resamples']==1000
+    assert cfg['model']['filtering_permutation_resamples']==1000
     assert cfg['training']['warmup_max_epochs']==100 and cfg['training']['relation_alignment_max_epochs']==100
     expected=['TBUT_1m','CFS_1m','SIT_1m','OSDI_1m'];assert cfg['tasks']['task4']['targets']==expected
     source=pd.DataFrame([{'Image_Name':'x.png','Name':'p1','Age':'40','Sex':'Female','OSDI':'20','Pain_Score':'2','BUT':'3','CFS':'4','SIT':'5','OSDI_1m':'10','BUT_1m':'6','CFS_1m':'1','SIT_1m':'8'}])
@@ -217,6 +236,8 @@ def test_relation_views_respect_variable_types_and_top_rho_backfill():
     candidates=torch.tensor([1,2,3]);significant=torch.tensor([False,True,False,False,False])
     selected,budget=top_rho_retention(hs,ks,candidates,significant,.6,5)
     assert budget==3 and selected.tolist()==[1,2,3]
+    with pytest.raises(RuntimeError,match='fewer than fixed top-rho budget'):
+        top_rho_retention(hs,ks,torch.tensor([1,2]),significant,.6,5)
 
 
 def test_six_identity_stage1_and_stage2_training_steps(monkeypatch):

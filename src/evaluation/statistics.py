@@ -4,6 +4,32 @@ from typing import Callable
 
 import numpy as np
 from scipy.stats import norm
+from sklearn.metrics import mean_absolute_error,roc_auc_score
+
+
+def aggregate_case_predictions(case_ids: np.ndarray,target: np.ndarray,*predictions: np.ndarray,
+                               classification: bool|None=None) -> tuple[np.ndarray,...]:
+    """Average repeated image predictions before a paper statistical test.
+
+    Classification labels must be constant within a case. Continuous targets
+    are averaged, matching the case-level aggregation used for predictions.
+    """
+    cases=np.asarray(case_ids).astype(str);truth=np.asarray(target);values=[np.asarray(x) for x in predictions]
+    if any(len(x)!=len(cases) for x in (truth,*values)):raise ValueError('case IDs, targets and predictions must have equal row counts')
+    unique=[];groups=[]
+    for case in cases:
+        if case not in unique:unique.append(case)
+    for case in unique:groups.append(np.flatnonzero(cases==case))
+    if classification is None:classification=np.issubdtype(truth.dtype,np.integer) and truth.ndim==1
+    aggregated_truth=[];aggregated=[[] for _ in values]
+    for indices in groups:
+        observed=truth[indices]
+        if classification:
+            if len(np.unique(observed))!=1:raise ValueError('classification target is inconsistent within a case')
+            aggregated_truth.append(observed[0])
+        else:aggregated_truth.append(observed.mean(axis=0))
+        for destination,value in zip(aggregated,values):destination.append(value[indices].mean(axis=0))
+    return (np.asarray(aggregated_truth),*(np.asarray(x) for x in aggregated))
 
 
 def paired_permutation_test(target: np.ndarray,prediction_a: np.ndarray,prediction_b: np.ndarray,
@@ -41,3 +67,22 @@ def delong_auc_test(target: np.ndarray,score_a: np.ndarray,score_b: np.ndarray) 
 
 def bonferroni(pvalues: np.ndarray|list[float]) -> np.ndarray:
     values=np.asarray(pvalues,float);return np.minimum(values*values.size,1.0)
+
+
+def paper_statistical_test(case_ids: np.ndarray,target: np.ndarray,prediction_a: np.ndarray,prediction_b: np.ndarray,
+                           analysis: str,*,resamples: int=10000,seed: int=3407) -> tuple[float,float]:
+    """Run the manuscript-specified paired case-level comparison.
+
+    ``analysis`` is one of ``multiclass_auc``, ``binary_auc`` or
+    ``regression_mae``. Multiplicity correction is deliberately performed by
+    the caller across the complete family of baseline comparisons.
+    """
+    truth,a,b=aggregate_case_predictions(case_ids,target,prediction_a,prediction_b,classification=analysis!='regression_mae')
+    if analysis=='multiclass_auc':
+        metric=lambda y,p:roc_auc_score(y,p,multi_class='ovr',average='macro')
+        return paired_permutation_test(truth,a,b,metric,resamples=resamples,seed=seed)
+    if analysis=='regression_mae':
+        return paired_permutation_test(truth,a,b,mean_absolute_error,resamples=resamples,seed=seed)
+    if analysis=='binary_auc':
+        difference,pvalue,_=delong_auc_test(truth,a,b);return difference,pvalue
+    raise ValueError(f'unsupported paper statistical analysis {analysis!r}')

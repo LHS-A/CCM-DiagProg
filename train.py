@@ -11,7 +11,7 @@ from src.config import get_task,load_config
 from src.data.dataset import CCMManifestDataset
 from src.models import UnifiedCausalCCM
 from src.models.relations import build_relation_prior
-from src.models.screening import screen_channels
+from src.models.filtering import filter_channels
 from src.utils.huggingface import resolve_cached_model
 from src.utils.io import set_seed
 
@@ -148,22 +148,22 @@ def construct_priors(model,entries,device,cfg,seed,out,fold_id):
         torch.save(prior.cpu(),task_dir/'M_prior.pt')
         (task_dir/'relation_view_weights.json').write_text(json.dumps({'clinical_weights':relation_audit['clinical_weights'],'projection_weights':relation_audit['projection_weights'],'clinical_bootstraps':relation_audit['clinical_bootstraps'],'projection_bootstraps':relation_audit['projection_bootstraps']},indent=2)+'\n')
     (out/'relation_prior_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
-def screen_all(model,entries,device,cfg,seed,out):
+def filter_all(model,entries,device,cfg,seed,out):
     audit={}
     for entry in entries:
         identity=entry['identity'];_,descriptors,target,nuisance,_,patients=collect_statistics(model,entry,device)
-        full_n=len(descriptors);configured=cfg['model'].get('screening_max_patients');maximum=full_n if configured is None else int(configured)
+        full_n=len(descriptors);configured=cfg['model'].get('filtering_max_samples');maximum=full_n if configured is None else int(configured)
         if full_n>maximum:
             generator=torch.Generator().manual_seed(seed+identity*3037)
             chosen=torch.randperm(full_n,generator=generator)[:maximum]
             descriptors,target,nuisance=descriptors[chosen],target[chosen],nuisance[chosen];patients=[patients[i] for i in chosen.tolist()]
         rho=float(task_setting(cfg['model']['retained_channel_ratio'],identity))
-        selected,details=screen_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['screening_fdr']),seed+identity*2029,permutation_resamples=int(cfg['model']['screening_permutation_resamples']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
-        model.set_channels(identity,selected);audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','target_representation_shape':list(target.shape),'nuisance_shape':list(nuisance.shape),'rho_t':rho,'selected_channels':selected.cpu().tolist(),'selected_feature_dim':len(selected),'available_patients':full_n,'screening_patients':len(descriptors),'patient_ids':patients,'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement','screening':details}
-        task_dir=out/'screening'/IDENTITY_NAMES[identity];task_dir.mkdir(parents=True,exist_ok=True)
+        selected,details=filter_channels(descriptors.to(device),target.to(device),nuisance.to(device),entry['task']['kind']=='classification',rho,float(cfg['model']['filtering_fdr']),seed+identity*2029,permutation_resamples=int(cfg['model']['filtering_permutation_resamples']),gcv_min=float(cfg['model']['kci_gcv_min']),gcv_max=float(cfg['model']['kci_gcv_max']),gcv_candidates=int(cfg['model']['kci_gcv_candidates']))
+        model.set_channels(identity,selected);audit[str(identity)]={'task':IDENTITY_NAMES[identity],'partition':'train','target_representation_shape':list(target.shape),'nuisance_shape':list(nuisance.shape),'rho_t':rho,'selected_channels':selected.cpu().tolist(),'selected_feature_dim':len(selected),'available_samples':full_n,'filtering_samples':len(descriptors),'patient_ids':patients,'sampling':'all' if full_n<=maximum else 'deterministic_without_replacement','filtering':details}
+        task_dir=out/'feature_filtering'/IDENTITY_NAMES[identity];task_dir.mkdir(parents=True,exist_ok=True)
         files={'hsic_statistics':details['hsic_statistics'],'hsic_pvalues':details['hsic_p'],'hsic_rejected':details['hsic_rejected'],'kci_statistics':details['kci_statistics'],'kci_pvalues':details['kci_p'],'kci_rejected':details['kci_rejected'],'retention_ratio':rho,'selected_channels':selected.cpu().tolist()}
         for name,value in files.items():(task_dir/f'{name}.json').write_text(json.dumps(value,indent=2)+'\n')
-    (out/'channel_screening_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
+    (out/'channel_filtering_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
 
 def save(model,cfg,history,path,epoch,fold_id):torch.save({'model_state':model.state_dict(),'config':cfg,'history':history,'global_epoch':epoch,'fold_id':str(fold_id),'task_identities':IDENTITY_NAMES},path)
 def learning_rate(cfg,epoch):
@@ -199,7 +199,7 @@ def main():
     construct_priors(model,entries,device,cfg,args.seed,args.output,args.fold_id)
     relation_stop=min(maximum,epoch+int(cfg['training']['relation_alignment_max_epochs']))
     epoch=optimize_phase(model,entries,optimizer,device,1,cfg,history,epoch,relation_stop,'prior_alignment',args.output,args.fold_id)
-    screen_all(model,entries,device,cfg,args.seed,args.output)
+    filter_all(model,entries,device,cfg,args.seed,args.output)
     model.set_stage_trainability(2)
     optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=float(cfg['training']['learning_rate']),weight_decay=float(cfg['training']['weight_decay']))
     if epoch>=maximum:raise RuntimeError('Stage 1 consumed the complete 500-epoch budget before Stage 2')

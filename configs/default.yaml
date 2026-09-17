@@ -38,13 +38,13 @@ model:
   structural_loss_weight: 1.0
   hyper_loss_weight: 5.0e-4
   relation_bootstrap_resamples: 1000
-  screening_permutation_resamples: 1000
+  filtering_permutation_resamples: 1000
   nmi_neighbors: 5
   kci_gcv_min: 1.0e-6
   kci_gcv_max: 1.0e1
   kci_gcv_candidates: 50
-  screening_fdr: 0.05
-  screening_max_patients: null
+  filtering_fdr: 0.05
+  filtering_max_samples: null
 
 training:
   batch_size: 16
@@ -83,10 +83,10 @@ tasks:
     classes: [HC, DPN-, DPN+]
     folder_aliases: {DPN-: NODPN, DPN+: DPN}
     output_dim: 3
-    expected_internal_images: 5894
-    expected_internal_patients: 450
+    expected_internal_images: 5920
+    expected_internal_patients: 277
     expected_external_images: 3832
-    expected_external_patients: 616
+    expected_external_patients: 224
     primary_metric: macro_auc
     secondary_metric: accuracy
     maximize: true
