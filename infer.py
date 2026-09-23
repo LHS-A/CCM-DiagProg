@@ -16,6 +16,7 @@ from scipy.stats import pearsonr,spearmanr
 
 from src.config import get_task, load_config
 from src.data.dataset import CCMManifestDataset
+from src.data.patient import aggregate_predictions, patient_targets
 from src.models import UnifiedCausalCCM
 from src.utils.huggingface import resolve_cached_model
 
@@ -85,24 +86,36 @@ def main():
             predictions.append(output.cpu().numpy())
     prediction = np.concatenate(predictions)
     names = IDENTITY_TARGETS.get(args.identity, task.get("classes", task.get("targets")))
-    output = frame[[c for c in ("image_path", "patient_id", "split") if c in frame]].copy()
     if task['kind']=='classification':
         if prediction.shape[1]==1:
             positive=1/(1+np.exp(-prediction[:,0]));probabilities=np.column_stack((1-positive,positive))
         else:
             probabilities=np.exp(prediction-prediction.max(1,keepdims=True));probabilities/=probabilities.sum(1,keepdims=True)
-        output['predicted_label']=probabilities.argmax(1);output['predicted_class']=[names[x] for x in output.predicted_label]
-        for index,name in enumerate(names):output[f'probability_{name}']=probabilities[:,index]
+        patient_prediction,patient_ids=aggregate_predictions(probabilities,frame.patient_id.astype(str).tolist())
+        raw_target=torch.as_tensor(frame.label.to_numpy(int));raw_mask=torch.ones(len(frame),dtype=torch.bool)
+        patient_truth,_,target_ids=patient_targets(raw_target,raw_mask,frame.patient_id.astype(str).tolist(),True)
+        if patient_ids!=target_ids:raise RuntimeError('patient aggregation order mismatch')
+        output=pd.DataFrame({'patient_id':patient_ids,'predicted_label':patient_prediction.argmax(1)})
+        output['predicted_class']=[names[x] for x in output.predicted_label]
+        for index,name in enumerate(names):output[f'probability_{name}']=patient_prediction[:,index]
     else:
-        for index, name in enumerate(names): output[f"prediction_{name}"] = prediction[:, index]
+        state=payload.get('target_normalizers',{}).get(IDENTITY_NAMES[args.identity])
+        if state is None:raise RuntimeError('checkpoint lacks training-partition regression normalizer; retrain with the current method')
+        prediction=prediction*np.asarray(state['std'])[None]+np.asarray(state['mean'])[None]
+        patient_prediction,patient_ids=aggregate_predictions(prediction,frame.patient_id.astype(str).tolist())
+        target_names=IDENTITY_TARGETS.get(args.identity,task['targets']);indices=[task['targets'].index(x) for x in target_names]
+        raw=torch.as_tensor(frame[task['targets']].to_numpy(float)[:,indices],dtype=torch.float64);mask=torch.isfinite(raw)
+        patient_truth,patient_mask,target_ids=patient_targets(torch.nan_to_num(raw),mask,frame.patient_id.astype(str).tolist(),False)
+        if patient_ids!=target_ids:raise RuntimeError('patient aggregation order mismatch')
+        output=pd.DataFrame({'patient_id':patient_ids})
+        for index, name in enumerate(names): output[f"prediction_{name}"] = patient_prediction[:, index]
     args.output.parent.mkdir(parents=True, exist_ok=True); output.to_csv(args.output, index=False)
     rows=[]
     if task['kind']=='classification':
-        rows=classification_metric_rows(frame.label.to_numpy(int),probabilities,names)
+        rows=classification_metric_rows(patient_truth.numpy().astype(int),patient_prediction,names)
     else:
-        target_names=IDENTITY_TARGETS.get(args.identity,task['targets']);indices=[task['targets'].index(x) for x in target_names]
-        truth=frame[task['targets']].to_numpy(float)[:,indices]
-        rows=regression_metric_rows(truth,prediction,target_names)
+        truth=np.where(patient_mask.numpy(),patient_truth.numpy(),np.nan)
+        rows=regression_metric_rows(truth,patient_prediction,target_names)
     if args.metrics:
         args.metrics.parent.mkdir(parents=True,exist_ok=True);pd.DataFrame(rows).to_csv(args.metrics,index=False)
     print(args.output)

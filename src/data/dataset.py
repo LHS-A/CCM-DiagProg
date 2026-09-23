@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable, Optional
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -157,9 +158,14 @@ class CCMManifestDataset(Dataset):
         fields=self._clinical_fields(row);unavailable=not fields
         if self.clinical_missingness is None:
             n=int(torch.randint(0,len(fields)+1,()).item())
+            order=torch.randperm(len(fields)).tolist()
         else:
             n=int(np.floor(float(self.clinical_missingness)*len(fields)+0.5))
-        order=torch.randperm(len(fields)).tolist();removed=set(order[:n]);fields=[x for i,x in enumerate(fields) if i not in removed]
+            # All images of one patient/task use the same inference context.
+            material=f"{row.patient_id}|{self.clinical_missingness}|{','.join(x[1] for x in fields)}".encode()
+            seed=int.from_bytes(hashlib.sha256(material).digest()[:8],"little")
+            order=np.random.default_rng(seed).permutation(len(fields)).tolist()
+        removed=set(order[:n]);fields=[x for i,x in enumerate(fields) if i not in removed]
         available=(not unavailable) and bool(fields);sentence=self._serialize_clinical(fields) if available else ""
         encoded = self.tokenizer(
             sentence, max_length=self.max_length,

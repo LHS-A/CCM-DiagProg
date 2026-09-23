@@ -49,6 +49,6 @@ class StructuralPrior(nn.Module):
         prior = self.prior.to(dependency.dtype) * (1 - eye)
         dependency = dependency / (dependency.norm() + 1e-6)
         prior = prior / (prior.norm() + 1e-6)
-        # Eq. (4) averages only the C(C-1) off-diagonal relations.
-        channels = dependency.shape[0]
-        return (dependency - prior.detach()).square().sum() / max(channels * (channels - 1), 1)
+        # Eq. (4) is the squared Frobenius norm after off-diagonal
+        # normalization; it has no additional channel-count denominator.
+        return (dependency - prior.detach()).square().sum()

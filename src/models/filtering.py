@@ -31,15 +31,14 @@ def top_rho_retention(hsic_scores,kci_scores,hsic_candidates,significant,retenti
     """Retain exactly floor(rho*C) channels using the paper's two rankings."""
     budget=max(1,int(np.floor(total_channels*retention_ratio)))
     if significant.numel()!=total_channels:raise ValueError('significant mask must be defined over all visual channels')
-    if len(hsic_candidates)<budget:
-        raise RuntimeError(f'HSIC coarse candidate set has {len(hsic_candidates)} channels, fewer than fixed top-rho budget {budget}')
     selected=torch.where(significant)[0]
     if len(selected)>=budget:
         selected=selected[torch.topk(kci_scores[selected],budget).indices]
     else:
-        hsic_only=hsic_candidates[~significant[hsic_candidates]];needed=budget-len(selected)
-        if len(hsic_only)<needed:raise RuntimeError('HSIC-only candidates cannot complete the fixed top-rho budget')
-        selected=torch.cat((selected,hsic_only[torch.topk(hsic_scores[hsic_only],needed).indices]))
+        # Paper fallback: fill from *all* unselected channels by marginal HSIC
+        # score, not merely from the coarse significance set.
+        remaining=torch.where(~significant)[0];needed=budget-len(selected)
+        selected=torch.cat((selected,remaining[torch.topk(hsic_scores[remaining],needed).indices]))
     return selected.sort().values,budget
 
 @torch.no_grad()
@@ -63,23 +62,23 @@ def filter_channels(descriptors,target,nuisance,categorical,retention_ratio,alph
     # Sec. 2.1.3: only marginally supported channels form S_HSIC. KCI is
     # evaluated exclusively on this task-specific coarse candidate set.
     candidates_idx=torch.where(hsic_rejected)[0]
-    budget=max(1,int(np.floor(channels*retention_ratio)))
-    if len(candidates_idx)<budget:
-        raise RuntimeError(f'HSIC coarse candidate set has {len(candidates_idx)} channels, fewer than fixed top-rho budget {budget}')
-    candidate_kx=kx.index_select(0,candidates_idx)
-    joint=_center_batch(candidate_kx*kz);rx=torch.einsum('ij,cjk,kl->cil',residual,joint,residual);ry=residual@ky@residual;candidate_ks=(rx*ry.T).sum((-2,-1))/n
-    def knull(count):
-        permutations=torch.stack([torch.randperm(n,generator=rng,device=device) for _ in range(count)])
-        pry=torch.stack([residual@ky[p][:,p]@residual for p in permutations]);return torch.einsum('cij,pji->pc',rx,pry)/n
-    kp_candidate,kn_candidate=_permutation_many(candidate_ks,knull,permutation_resamples)
-    candidate_rejected=_bh(kp_candidate,alpha)
-    kp_t=torch.full((channels,),float('nan'),device=device);kp_t[candidates_idx]=kp_candidate
-    kn_t=torch.zeros(channels,dtype=torch.long,device=device);kn_t[candidates_idx]=kn_candidate
-    ks=torch.full((channels,),float('-inf'),device=device);ks[candidates_idx]=candidate_ks
-    kci_rejected=torch.zeros(channels,dtype=torch.bool,device=device);kci_rejected[candidates_idx]=candidate_rejected
+    kp_t=torch.full((channels,),float('nan'),device=device)
+    ks=torch.full((channels,),float('-inf'),device=device)
+    kn_t=torch.zeros(channels,dtype=torch.long,device=device)
+    kci_rejected=torch.zeros(channels,dtype=torch.bool,device=device)
+    if len(candidates_idx):
+        candidate_kx=kx.index_select(0,candidates_idx)
+        joint=_center_batch(candidate_kx*kz);rx=torch.einsum('ij,cjk,kl->cil',residual,joint,residual);ry=residual@ky@residual;candidate_ks=(rx*ry.T).sum((-2,-1))/n
+        def knull(count):
+            permutations=torch.stack([torch.randperm(n,generator=rng,device=device) for _ in range(count)])
+            pry=torch.stack([residual@ky[p][:,p]@residual for p in permutations]);return torch.einsum('cij,pji->pc',rx,pry)/n
+        kp_candidate,kn_candidate=_permutation_many(candidate_ks,knull,permutation_resamples)
+        candidate_rejected=_bh(kp_candidate,alpha)
+        kp_t[candidates_idx]=kp_candidate;kn_t[candidates_idx]=kn_candidate
+        ks[candidates_idx]=candidate_ks;kci_rejected[candidates_idx]=candidate_rejected
     significant=hsic_rejected & kci_rejected
-    # S_sig=S_HSIC intersection S_KCI. If it is short, only S_HSIC\S_sig is
-    # eligible for HSIC-score backfilling; no out-of-pool fallback is allowed.
+    # S_sig=S_HSIC intersection S_KCI. A short intersection is completed from
+    # every still-unselected channel using the marginal HSIC ranking.
     indices,budget=top_rho_retention(hs,ks,candidates_idx,significant,retention_ratio,channels)
     ranking=torch.argsort(ks,descending=True)
     details={'lambda_kci':float(lam),'descriptor_bandwidths':bandwidth.cpu().tolist(),'nuisance_bandwidth':float(nuisance_bandwidth),

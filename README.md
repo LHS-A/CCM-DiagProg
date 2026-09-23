@@ -38,7 +38,8 @@ image_path,patient_id,split,clinical_text
 
 Task 3 supplies two shared-model identities: ocular-surface regression and HbA1c regression.
 All rows belonging to one patient must occur in exactly one partition. The
-trainer rejects any patient overlap. Non-target structured clinical variables
+trainer also rejects a patient assigned to different partitions in different
+tasks. Non-target structured clinical variables
 use the `clinical_` prefix and may be declared as `continuous`, `ordinal`,
 `binary`, or `nominal`. Target, future and proxy fields are excluded by the
 identity-specific allow/exclude rules in `configs/default.yaml`. Safe fields
@@ -59,7 +60,18 @@ The trainer saves `best_model.pt`, periodic checkpoints every 10 epochs, and
 JSON audits for relation-prior construction and channel filtering. AdamW uses
 the paper's cosine schedule from `1e-4` to `1e-6`.
 
-Feature filtering is independent for all six prediction settings. `retained_channel_ratio` is configured by setting, while RBF bandwidths, KCI regularization, permutation counts, FDR decisions, rankings, and retained channel indices are estimated separately from each setting's training partition. HSIC-significant channels form the coarse set `S_HSIC`; KCI is evaluated only on that set, and `S_sig = S_HSIC ∩ S_KCI`. If `S_sig` is smaller than `K=max(1,floor(rho*C))`, the remaining positions are filled only from `S_HSIC \ S_sig` in descending HSIC-score order. No channel outside `S_HSIC` is used as a fallback. The complete evidence is written to `relation_prior_audit.json`, `channel_filtering_audit.json`, and `feature_filtering/<identity>/`.
+Feature filtering is independent for all six prediction settings. The fixed
+paper value is `rho=0.30`. RBF bandwidths, KCI regularization, permutation
+tests, FDR decisions, rankings, and retained channel indices are estimated
+separately from each setting's training patients. GAP/GMP descriptors are
+first averaged across each patient's images. HSIC-significant channels form
+the coarse set `S_HSIC`; KCI is evaluated only on that set, and
+`S_sig = S_HSIC ∩ S_KCI`. If `S_sig` is smaller than
+`K=max(1,floor(rho*C))`, every significant channel is retained and the
+remaining positions are filled from all still-unselected channels in
+descending HSIC-score order. The complete evidence is written to
+`relation_prior_audit.json`, `channel_filtering_audit.json`, and
+`feature_filtering/<identity>/`.
 
 Clinical relation priors are also task- and fold-specific. For every identity,
 the trainer independently constructs `C_clin,t`, multi-view `A_rel,t`, `Pi_t`
@@ -67,6 +79,9 @@ and `M_prior,t` from that fold's training patients. Exact state and provenance
 are stored under `relation_priors/<identity>/` as clinical metadata and hashes,
 normalization statistics, relation-view weights, `A_rel.json`, `Pi.pt`, and
 `M_prior.pt`. No cross-task or cross-fold relation cache is used.
+Each patient contributes once: channel GAP responses and clinical rows are
+aggregated before association estimation. Bootstrap stability uses
+`tau_v=0.05`; channel-to-clinical soft correspondence uses `tau_r=0.5`.
 
 Run all five patient-level folds (test fold, following validation fold, and
 three training folds) with:
@@ -80,6 +95,12 @@ python scripts/train_unified_five_folds.py \
 
 Every fold launches a new shared model and independently reconstructs its
 training-only relation priors, kernels, permutation tests and six channel sets.
+One global patient-to-fold map is shared across tasks. Patient-balanced
+sampling chooses patients uniformly and then one image per selected patient;
+the six task mini-batches contain 3/3/3/3/2/2 images, for a total batch size of
+16. The loss is averaged image-within-patient, patient-within-task, then
+equally across tasks. Regression targets are standardized with training-fold
+patient statistics stored in the checkpoint.
 
 The warm-up, prior-alignment and semantic-hypernetwork phases restore their
 best validation checkpoint before continuing. The final checkpoint stores all
@@ -106,6 +127,12 @@ python infer.py ... --text-missingness 1.0
 ```
 
 Identity indices are zero-based and follow the task table above.
+Predictions and metrics are patient-level: image probabilities are averaged
+for classification/prognosis and continuous image predictions are averaged
+for regression. Regression outputs are inverse-transformed using the saved
+training-fold normalizer. Internal point estimates pool held-out-fold patient
+predictions; external point estimates average patient predictions from the
+five fold-specific models before metrics are calculated.
 
 Evaluate all held-out folds and the fixed external cohorts with:
 

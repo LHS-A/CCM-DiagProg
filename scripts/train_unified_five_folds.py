@@ -38,10 +38,23 @@ def patient_folds(frame:pd.DataFrame,seed:int)->dict[str,int]:
     return assignment
 
 
+def cross_task_patient_folds(frames:dict[str,pd.DataFrame],seed:int)->dict[str,int]:
+    """One global fold identity for every patient occurring in any task."""
+    patients=sorted({str(patient) for frame in frames.values() for patient in frame.patient_id})
+    if len(patients)<5:raise ValueError("five-fold training requires at least five unique patients")
+    table=np.asarray(patients,dtype=object);splitter=KFold(5,shuffle=True,random_state=seed)
+    assignment={}
+    for fold,(_,held) in enumerate(splitter.split(table)):
+        for index in held:assignment[str(table[index])]=fold
+    return assignment
+
+
 def create_manifests(source:Path,destination:Path,outer:int,seed:int)->None:
     destination.mkdir(parents=True,exist_ok=True)
+    frames={task:pd.read_csv(source/f"{task}.csv") for task in TASKS}
+    assignment=cross_task_patient_folds(frames,seed)
     for task in TASKS:
-        frame=pd.read_csv(source/f"{task}.csv");assignment=patient_folds(frame,seed)
+        frame=frames[task].copy()
         patient_fold=frame.patient_id.astype(str).map(assignment)
         frame["split"]=np.where(patient_fold.eq(outer),"test",np.where(patient_fold.eq((outer+1)%5),"validation","train"))
         sets={name:set(frame.loc[frame.split.eq(name),"patient_id"].astype(str)) for name in ("train","validation","test")}

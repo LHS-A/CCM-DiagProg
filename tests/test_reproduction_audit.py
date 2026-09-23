@@ -11,10 +11,11 @@ from src.models.filtering import filter_channels,top_rho_retention
 from src.models.causal_ccm import StructuralPrior
 from src.models.relations import association_views,build_relation_prior
 from src.data.dataset import CCMManifestDataset
+from src.data.patient import PatientBalancedBatchSampler,patient_mean,regression_normalizer
 from src.data.manifests import regression_manifest
 from src.config import load_config
-from train import balanced_epoch,collect_statistics,learning_rate,task_exclusions,validate_patient_partition
-from scripts.train_unified_five_folds import patient_folds
+from train import balanced_epoch,collect_statistics,identity_batch_size,learning_rate,patient_average,task_exclusions,validate_cross_task_partitions,validate_patient_partition
+from scripts.train_unified_five_folds import cross_task_patient_folds,patient_folds
 import src.models.unified_causal_ccm as unified
 import src.models.filtering as filtering
 from infer import classification_metric_rows
@@ -26,8 +27,8 @@ class DummyVisual(nn.Module):
 
 
 class DummyText(nn.Module):
-    def __init__(self):super().__init__();self.config=SimpleNamespace(hidden_size=312);self.embedding=nn.Embedding(100,312)
-    def forward(self,input_ids,attention_mask):return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+    def __init__(self):super().__init__();self.config=SimpleNamespace(hidden_size=312);self.embedding=nn.Embedding(100,312);self.calls=[]
+    def forward(self,input_ids,attention_mask):self.calls.append(len(input_ids));return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
 
 
 def model(monkeypatch):
@@ -61,6 +62,14 @@ def test_residual_path_patient_conditioning_and_freezing(monkeypatch):
     assert torch.isfinite(missing).all()
     net.set_stage_trainability(1);assert any(p.requires_grad for p in net.visual_encoder.parameters());assert not any(p.requires_grad for p in net.text_encoder.parameters())
     net.set_stage_trainability(2);assert not any(p.requires_grad for p in net.visual_encoder.parameters());assert any(p.requires_grad for p in net.text_encoder.parameters())
+
+
+def test_zero_context_bypasses_bert_including_mixed_batches(monkeypatch):
+    net=model(monkeypatch);net.set_channels(0,torch.arange(4));net.eval()
+    image=torch.ones(2,3,8,8);ids=torch.ones(2,3,dtype=torch.long);mask=torch.ones_like(ids)
+    net(image,ids,mask,0,torch.zeros(2,dtype=torch.bool));assert net.text_encoder.calls==[]
+    result=net(image,ids,mask,0,torch.tensor([True,False]))
+    assert net.text_encoder.calls==[1] and torch.isfinite(result['prediction']).all()
 
 
 def test_checkpoint_roundtrip_restores_task_specific_subsets(monkeypatch):
@@ -149,6 +158,8 @@ def test_paper_cosine_schedule_and_patient_folds():
     frame=pd.DataFrame({'patient_id':[f'p{i}' for i in range(20) for _ in range(2)],'label':[i%2 for i in range(20) for _ in range(2)]})
     assignment=patient_folds(frame,3407)
     assert len(assignment)==20 and set(assignment.values())==set(range(5))
+    sizes=[identity_batch_size(16,identity) for identity in range(6)]
+    assert sizes==[3,3,3,3,2,2] and sum(sizes)==16
 
 
 def test_eq1_eq4_visual_relation_denominator_and_stop_gradient():
@@ -160,7 +171,7 @@ def test_eq1_eq4_visual_relation_denominator_and_stop_gradient():
     numerator=torch.einsum('bcp,bdp->bcd',normalized,normalized);energy=normalized.square().sum(-1)
     relation=(numerator/(energy[:,:,None].sqrt()*energy[:,None,:].sqrt()+1e-6)).mean(0)
     eye=torch.eye(3);relation=relation*(1-eye);reference=prior*(1-eye)
-    expected=(relation/(relation.norm()+1e-6)-reference/(reference.norm()+1e-6)).square().sum()/(3*2)
+    expected=(relation/(relation.norm()+1e-6)-reference/(reference.norm()+1e-6)).square().sum()
     assert torch.allclose(loss,expected);loss.backward()
     assert feature.grad is not None and module.prior.grad is None
 
@@ -232,25 +243,26 @@ def test_relation_views_respect_variable_types_and_top_rho_backfill():
     views=association_views(x,x,k=2,x_types=['nominal','continuous'],y_types=['nominal','continuous'])
     assert np.isnan(views[0,1,0]) and np.isnan(views[0,1,1])
     assert np.isfinite(views[0,1,2:]).all() and np.isfinite(views[1,1]).all()
+    assert views[1,1,0]==pytest.approx(1.0)
     hs=torch.tensor([.1,.9,.8,.7,.2]);ks=torch.tensor([float('-inf'),.5,.4,.3,float('-inf')])
     candidates=torch.tensor([1,2,3]);significant=torch.tensor([False,True,False,False,False])
     selected,budget=top_rho_retention(hs,ks,candidates,significant,.6,5)
     assert budget==3 and selected.tolist()==[1,2,3]
-    with pytest.raises(RuntimeError,match='fewer than fixed top-rho budget'):
-        top_rho_retention(hs,ks,torch.tensor([1,2]),significant,.6,5)
+    selected,budget=top_rho_retention(hs,ks,torch.tensor([1,2]),significant,.8,5)
+    assert budget==4 and selected.tolist()==[1,2,3,4]
 
 
 def test_six_identity_stage1_and_stage2_training_steps(monkeypatch):
     net=model(monkeypatch);device=torch.device('cpu')
     for identity in range(6):net.set_channels(identity,torch.arange(4))
-    base={'image':torch.ones(1,3,8,8),'input_ids':torch.ones(1,3,dtype=torch.long),'attention_mask':torch.ones(1,3,dtype=torch.long),'clinical_available':torch.ones(1,dtype=torch.bool)}
+    base={'image':torch.ones(1,3,8,8),'input_ids':torch.ones(1,3,dtype=torch.long),'attention_mask':torch.ones(1,3,dtype=torch.long),'clinical_available':torch.ones(1,dtype=torch.bool),'patient_id':['p1']}
     entries=[]
     for identity,out in enumerate(unified.OUTPUT_DIMS):
         classification=identity in {0,1,5}
         width=5 if identity in {2,3} else out
         batch={**base,'target':torch.zeros((1,),dtype=torch.long) if classification else torch.zeros(1,width),'target_mask':torch.ones((1,),dtype=torch.bool) if classification else torch.ones(1,width,dtype=torch.bool)}
         indices=[1,2,3,4] if identity==2 else ([0] if identity==3 else None)
-        entries.append({'identity':identity,'indices':indices,'task':{'kind':'classification' if classification else 'regression'},'loaders':{'train':[batch],'validation':[batch]}})
+        entries.append({'identity':identity,'indices':indices,'task':{'kind':'classification' if classification else 'regression'},'target_mean':torch.zeros(out),'target_std':torch.ones(out),'loaders':{'train':[batch],'validation':[batch]}})
     cfg={'model':{'structural_loss_weight':1.0,'hyper_loss_weight':5e-4}}
     net.set_stage_trainability(1);optimizer=torch.optim.AdamW((p for p in net.parameters() if p.requires_grad),lr=1e-4)
     assert np.isfinite(balanced_epoch(net,entries,optimizer,device,1,cfg))
@@ -264,3 +276,45 @@ def test_paper_classwise_accuracy_and_macro_average():
     expected=np.mean([2/3,1/2,1.0])
     assert rows[0]['ACC']==pytest.approx(2/3) and rows[-1]['ACC']==pytest.approx(expected)
     assert rows[-1]['ACC']!=pytest.approx((pred==y).mean())
+
+
+def test_patient_level_statistics_and_balanced_sampling():
+    values=torch.tensor([[1.],[3.],[10.]])
+    aggregated,names=patient_mean(values,['p1','p1','p2'])
+    assert names==['p1','p2'] and aggregated[:,0].tolist()==[2.,10.]
+    mean,std=regression_normalizer(values,torch.ones_like(values,dtype=torch.bool),['p1','p1','p2'])
+    assert mean.item()==pytest.approx(6.) and std.item()==pytest.approx(4.)
+    sampler=PatientBalancedBatchSampler(['p1']*9+['p2'],batch_size=2,seed=7)
+    sampled=[index for batch in sampler for index in batch]
+    patients=[('p1' if index<9 else 'p2') for index in sampled]
+    assert abs(patients.count('p1')-patients.count('p2'))<=1
+    assert patient_average(torch.tensor([1.,3.,9.]),['p1','p1','p2']).item()==pytest.approx(5.5)
+
+
+def test_collect_statistics_uses_one_row_per_patient():
+    class Visual(nn.Module):
+        def forward(self,image):return image[:,0:1]
+    class Net(nn.Module):
+        def __init__(self):super().__init__();self.visual_encoder=Visual()
+    batch={'data_partition':['train']*3,'image':torch.tensor([[[[1.,1.],[1.,1.]]],[[[3.,3.],[3.,3.]]],[[[10.,10.],[10.,10.]]]]),
+           'target':torch.tensor([[2.],[2.],[8.]]),'target_mask':torch.ones(3,1,dtype=torch.bool),
+           'clinical_structured':torch.tensor([[1.],[1.],[2.]]),'clinical_relation':torch.tensor([[2.,1.],[2.,1.],[8.,2.]]),
+           'patient_id':['p1','p1','p2']}
+    entry={'identity':2,'indices':None,'task':{'kind':'regression'},'loaders':{'statistics':[batch]}}
+    gap,descriptor,target,nuisance,relation,names=collect_statistics(Net(),entry,torch.device('cpu'))
+    assert names==['p1','p2'] and gap[:,0].tolist()==[2.,10.]
+    assert descriptor[:,0,0].tolist()==[2.,10.] and target[:,0].tolist()==[2.,8.]
+    assert nuisance.shape==(2,1) and relation.shape==(2,2)
+
+
+def test_cross_task_fold_and_partition_isolation():
+    frames={
+        'a':pd.DataFrame({'patient_id':['shared','a1','a2','a3','a4']}),
+        'b':pd.DataFrame({'patient_id':['shared','b1','b2','b3','b4']}),
+    }
+    assignment=cross_task_patient_folds(frames,31)
+    assert assignment['shared'] in range(5)
+    valid=[('a',pd.DataFrame({'patient_id':['shared'],'split':['train']})),('b',pd.DataFrame({'patient_id':['shared'],'split':['train']}))]
+    validate_cross_task_partitions(valid)
+    invalid=[valid[0],('b',pd.DataFrame({'patient_id':['shared'],'split':['test']}))]
+    with pytest.raises(ValueError,match='cross-task patient leakage'):validate_cross_task_partitions(invalid)

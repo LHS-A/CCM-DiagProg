@@ -31,6 +31,8 @@ def test_training_only_prior_and_filtering_pipeline():
     rng=np.random.default_rng(12);clinical=rng.normal(size=(32,2));features=np.stack((clinical[:,0],clinical[:,1],clinical.sum(1),rng.normal(size=32)),1)
     prior,audit=build_relation_prior(torch.tensor(features,dtype=torch.float32),clinical,seed=3,k=2,resamples=5)
     assert prior.shape==(4,4) and torch.isfinite(prior).all() and audit['clinical_bootstraps']==5
+    assert audit['stability_temperature']==.05 and audit['projection_temperature']==.5
+    assert np.allclose(np.asarray(audit['Pi']).sum(1),1)
     descriptors=torch.tensor(np.stack((features,features**2),-1),dtype=torch.float32);target=torch.tensor(clinical[:,0],dtype=torch.float32);nuisance=torch.tensor(clinical[:,1:],dtype=torch.float32)
     selected,details=filter_channels(descriptors,target,nuisance,False,.75,1.0,5,permutation_resamples=25,gcv_candidates=5)
     assert len(selected)>0 and details['lambda_kci']>0

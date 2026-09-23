@@ -68,7 +68,9 @@ def association_views(x: np.ndarray, y: np.ndarray, k: int = 5, chunk: int = 128
     if not np.isfinite(x).all() or not np.isfinite(y).all():raise ValueError("association_views requires finite, training-imputed arrays")
     ordered={"continuous","ordinal","binary"}
     def corr(a,b):
-        a=(a-a.mean(0))/(a.std(0)+1e-12);b=(b-b.mean(0))/(b.std(0)+1e-12);return np.abs(a.T@b/max(n-1,1)).clip(0,1)
+        a=a-a.mean(0);b=b-b.mean(0)
+        denominator=np.sqrt((a*a).sum(0)[:,None]*(b*b).sum(0)[None,:]).clip(1e-12)
+        return np.abs((a.T@b)/denominator).clip(0,1)
     pearson=corr(x,y);spearman=corr(rankdata(x,axis=0),rankdata(y,axis=0))
     applicable=np.array([[a in ordered and b in ordered for b in y_types] for a in x_types])
     pearson=np.where(applicable,pearson,np.nan);spearman=np.where(applicable,spearman,np.nan);dcor=np.zeros((p,m))
@@ -113,7 +115,8 @@ def _nan_mean_variance(value: np.ndarray,axis: int) -> tuple[np.ndarray,np.ndarr
 
 
 def bootstrap_stability(estimator: Callable[[np.ndarray], np.ndarray], n: int, seed: int,
-                        resamples: int = 1000, off_diagonal: bool = False) -> BootstrapResult:
+                        resamples: int = 1000, off_diagonal: bool = False,
+                        temperature: float = 0.05) -> BootstrapResult:
     if n<2 or resamples<2:raise ValueError('bootstrap stability requires at least two samples and resamples')
     rng=np.random.default_rng(seed);indices=[rng.integers(0,n,n) for _ in range(resamples)]
     estimates=Parallel(n_jobs=min(8,resamples),prefer='threads')(delayed(estimator)(index) for index in indices)
@@ -126,7 +129,8 @@ def bootstrap_stability(estimator: Callable[[np.ndarray], np.ndarray], n: int, s
     valid_variance=np.isfinite(entry_variance);count=valid_variance.sum(0)
     per_view=np.divide(np.where(valid_variance,entry_variance,0).sum(0),count,out=np.full(entry_variance.shape[-1],np.nan),where=count>0);valid_view=np.isfinite(per_view)
     if not valid_view.any():raise RuntimeError('no applicable clinical relation view')
-    weights=np.zeros_like(per_view);log_weight=-per_view[valid_view];value=np.exp(log_weight-log_weight.max());weights[valid_view]=value/value.sum()
+    if temperature <= 0:raise ValueError('bootstrap stability temperature must be positive')
+    weights=np.zeros_like(per_view);log_weight=-per_view[valid_view]/temperature;value=np.exp(log_weight-log_weight.max());weights[valid_view]=value/value.sum()
     mean_views,_=_nan_mean_variance(stack,0);available=np.isfinite(mean_views)
     pair_weights=available*weights;pair_weights/=pair_weights.sum(-1,keepdims=True).clip(1e-12)
     aggregate=np.nansum(mean_views*pair_weights,axis=-1)
@@ -134,7 +138,8 @@ def bootstrap_stability(estimator: Callable[[np.ndarray], np.ndarray], n: int, s
 
 
 def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: int, k: int = 5,
-                         resamples: int = 1000,
+                         resamples: int = 1000, stability_temperature: float = 0.05,
+                         projection_temperature: float = 0.5,
                          clinical_columns: list[str] | None = None,
                          clinical_types: list[str] | None = None) -> tuple[torch.Tensor, dict]:
     """Training-only multi-view clinical prior projected into visual channel space."""
@@ -159,15 +164,17 @@ def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: 
     def clinical_estimate(index):
         return association_views(clinical[index],clinical[index],k,x_types=clinical_types,y_types=clinical_types)
 
-    clinical_result = bootstrap_stability(clinical_estimate,n,seed,resamples,off_diagonal=True)
+    clinical_result = bootstrap_stability(clinical_estimate,n,seed,resamples,off_diagonal=True,temperature=stability_temperature)
     a_rel = clinical_result.aggregate
 
     def projection_estimate(index):
         return association_views(z[index],clinical[index],k,x_types=["continuous"]*channels,y_types=clinical_types)
 
-    projection_result = bootstrap_stability(projection_estimate,n,seed+104729,resamples)
+    projection_result = bootstrap_stability(projection_estimate,n,seed+104729,resamples,temperature=stability_temperature)
     r = projection_result.aggregate
-    r = r - r.max(1, keepdims=True); projection = np.exp(r); projection /= projection.sum(1, keepdims=True)
+    if projection_temperature <= 0:raise ValueError('projection temperature must be positive')
+    logits=r/projection_temperature;logits=logits-logits.max(1,keepdims=True)
+    projection = np.exp(logits); projection /= projection.sum(1, keepdims=True)
     prior = projection @ a_rel @ projection.T
     metadata = {"training_samples":int(n),"visual_channels":int(channels),"clinical_variables":int(variables),
                 "clinical_columns":clinical_columns,"clinical_types":clinical_types,"clinical_matrix_shape":[int(n),int(variables)],
@@ -176,5 +183,7 @@ def build_relation_prior(features: torch.Tensor, clinical: np.ndarray, *, seed: 
                 "A_rel":a_rel.tolist(),"Pi":projection.tolist(),
                 "clinical_weights": clinical_result.weights.tolist(), "clinical_bootstraps": clinical_result.iterations,
                 "projection_weights": projection_result.weights.tolist(), "projection_bootstraps": projection_result.iterations,
-                "seed":int(seed),"nmi_neighbors":int(k)}
+                "seed":int(seed),"nmi_neighbors":int(k),
+                "stability_temperature":float(stability_temperature),
+                "projection_temperature":float(projection_temperature)}
     return torch.from_numpy(prior).float(), metadata

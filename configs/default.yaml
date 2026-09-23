@@ -38,6 +38,8 @@ model:
   structural_loss_weight: 1.0
   hyper_loss_weight: 5.0e-4
   relation_bootstrap_resamples: 1000
+  relation_stability_temperature: 0.05
+  relation_projection_temperature: 0.5
   filtering_permutation_resamples: 1000
   nmi_neighbors: 5
   kci_gcv_min: 1.0e-6

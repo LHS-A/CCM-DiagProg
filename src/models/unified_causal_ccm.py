@@ -85,12 +85,20 @@ class UnifiedCausalCCM(nn.Module):
             return {'prediction':self.auxiliary[task](F.adaptive_avg_pool2d(feature,1).flatten(1)),
                     'prior_loss':self.prior_for(task).loss(feature),'hyper_loss':feature.new_zeros(())}
         if bool(available.any()):
-            text=self.text_projection(self.text_encoder(input_ids=ids,attention_mask=attention).last_hidden_state)
-            text=text*available[:,None,None].to(text.dtype);patient=text[:,0]
+            # Zero-context samples bypass ClinicalBERT entirely.  In a mixed
+            # batch only rows with task-safe context enter the text encoder.
+            selected=torch.where(available)[0]
+            encoded=self.text_projection(self.text_encoder(
+                input_ids=ids.index_select(0,selected),
+                attention_mask=attention.index_select(0,selected),
+            ).last_hidden_state)
+            text=encoded.new_zeros((len(image),encoded.shape[1],encoded.shape[2]))
+            text.index_copy_(0,selected,encoded);patient=text[:,0]
         else:
             text=None;patient=feature.new_zeros(len(image),self.text_projection.out_features if isinstance(self.text_projection,nn.Linear) else int(self.text_encoder.config.hidden_size))
         aware=self.context(feature,text,attention,available,task,self.selected_channels(task));identity=torch.full((len(image),),task,dtype=torch.long,device=image.device)
         code=self.hyper(torch.cat((self.task_embedding(identity),patient),-1));dynamic=self.generators[task](code);out=OUTPUT_DIMS[task]
         feature_dim=aware.shape[1];weight=dynamic[:,:feature_dim*out].view(-1,feature_dim,out);bias=dynamic[:,feature_dim*out:];prediction=torch.bmm(aware[:,None],weight).squeeze(1)+bias
-        hyper_loss=(weight.square().sum((1,2))+bias.square().sum(1)).mean()
-        return {'prediction':prediction,'prior_loss':feature.new_zeros(()),'hyper_loss':hyper_loss}
+        dynamic_penalty=weight.square().sum((1,2))+bias.square().sum(1)
+        return {'prediction':prediction,'prior_loss':feature.new_zeros(()),
+                'hyper_loss':dynamic_penalty.mean(),'dynamic_penalty':dynamic_penalty}
